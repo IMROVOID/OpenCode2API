@@ -1,10 +1,12 @@
 <div align="center">
 
+<img src="assets/images/OpenCode2API_Banner.webp" alt="OpenCode2API Banner" width="100%">
+
 # OpenCode2API-Proxy
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![npm version](https://img.shields.io/npm/v/opencode2api-proxy.svg?logo=npm&logoColor=white)](https://www.npmjs.com/package/opencode2api-proxy)
-[![CI](https://github.com/IMROVOID/OpenCode2API-Proxy/actions/workflows/test.yml/badge.svg)](https://github.com/IMROVOID/OpenCode2API-Proxy/actions/workflows/test.yml)
+[![CI](https://github.com/IMROVOID/OpenCode2API/actions/workflows/test.yml/badge.svg)](https://github.com/IMROVOID/OpenCode2API/actions/workflows/test.yml)
 [![Node.js Version](https://img.shields.io/badge/Node.js-%3E%3D22.0.0-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.8.2-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
 [![Cloudflare Workers](https://img.shields.io/badge/Cloudflare-Workers-F38020?logo=cloudflare&logoColor=white)](https://workers.cloudflare.com/)
@@ -15,7 +17,7 @@
   OpenCode Zen and Go to a universal OpenAI, Responses and Anthropic compatible API router. Serve <b>Zen</b> and <b>Go</b> models from one endpoint with <b>protocol conversion, streaming, key rotation and a built-in control WebUI</b>.
 </p>
 
-[Overview](#what-is-opencode2api-proxy) • [Features](#key-features) • [Quick Start](#quick-start) • [Models](#model-catalog--aliases) • [Clients](#client-integration) • [Architecture](#architecture--structure) • [Guides](#advanced-guides) • [Disclaimer](#disclaimer--legal-notice) • [License](#license)
+[Overview](#what-is-opencode2api-proxy) • [Features](#key-features) • [Quick Start](#quick-start) • [Models](#model-catalog--aliases) • [Clients](#client-integration) • [Architecture](#architecture--structure) • [Guides](#advanced-guides) • [Disclaimer](#disclaimer--legal-notice) • [References](#references--acknowledgements) • [License](#license)
 
 </div>
 
@@ -39,6 +41,7 @@
   - [Continuous Integration (CI)](#continuous-integration-ci)
   - [Building the Release Archives](#building-the-release-archives)
 - [Disclaimer & Legal Notice](#disclaimer--legal-notice)
+- [References & Acknowledgements](#references--acknowledgements)
 - [License](#license)
 
 ## What is OpenCode2API-Proxy?
@@ -53,6 +56,8 @@
 4. It ships a **control WebUI** with a greyscale dark theme on every deployment method, so the same dashboard works locally, from an archive and on Cloudflare Workers.
 
 > **Note**: The Go lane requires an active OpenCode Go subscription and a workspace in the Global region. The free tier is served from the official OpenCode client only, so it needs that client's TLS fingerprint. See [Disclaimer & Legal Notice](#disclaimer--legal-notice).
+
+> **Reference**: Inspired by and referencing the original [jasonxu114514/opencode2api](https://github.com/jasonxu114514/opencode2api) repository.
 
 ## Key Features
 
@@ -155,7 +160,7 @@ Prebuilt archives for every supported platform are attached to each release.
 
 #### Step 1: Download
 
-Grab the archive that matches your platform from the [releases page](https://github.com/IMROVOID/OpenCode2API-Proxy/releases):
+Grab the archive that matches your platform from the [releases page](https://github.com/IMROVOID/OpenCode2API/releases):
 
 | Target | File |
 |---|---|
@@ -527,6 +532,10 @@ The archives land in `release/`.
 3. **No Warranty & No Guarantee**: The author and contributors make no claims, promises, or guarantees regarding the safety, status, or longevity of your OpenCode account or subscription. This software is provided "AS IS", without warranty of any kind, express or implied.
 4. **Assumption of Risk**: You assume full and sole responsibility for any outcomes or damages resulting from using this software, including but not limited to account termination, loss of API access, or data loss. Use strictly at your own risk.
 5. **Trademark Attribution**: All product names, logos, and brands (such as "OpenCode", "OpenAI", "Anthropic") are trademarks or registered trademarks of their respective owners. OpenCode2API-Proxy is an independent open-source project and is neither affiliated with, maintained by, nor endorsed by any of them.
+
+## References & Acknowledgements
+
+- [jasonxu114514/opencode2api](https://github.com/jasonxu114514/opencode2api) — Original reference repository for OpenCode API proxying and reverse engineering.
 
 ## License
 
