@@ -1,0 +1,20 @@
+name = "opencode2api-proxy"
+main = "worker/worker.js"
+compatibility_date = "2024-11-11"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+# The local API key clients must present (Authorization: Bearer or x-api-key).
+API_KEY = "change-this-local-key"
+# Set to "true" to enable the keyless anonymous free tier.
+ANONYMOUS = "false"
+# Set to "true" to serve the bundled control WebUI.
+WEBUI_ENABLED = "true"
+ADMIN_PASSWORD = "change-this-admin-password"
+# Comma-separated upstream credentials. Leave empty to use the anonymous lane.
+OPENCODE_ZEN_KEYS = ""
+OPENCODE_GO_KEYS = ""
+# Override the upstream origins when self-hosting a mirror.
+UPSTREAM_ZEN = "https://opencode.ai/zen"
+UPSTREAM_GO = "https://opencode.ai/zen/go"
+UPSTREAM_ANONYMOUS = "https://opencode.ai/inference"

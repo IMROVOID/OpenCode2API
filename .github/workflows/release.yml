@@ -1,0 +1,186 @@
+name: Build release archives
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, for example v1.0.0"
+        required: true
+        type: string
+      draft:
+        description: "Create the release as a draft"
+        required: false
+        type: boolean
+        default: true
+      skip_tests:
+        description: "Skip running automated tests"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Prepare release
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.metadata.outputs.release_tag }}
+    steps:
+      - name: Resolve release metadata
+        id: metadata
+        shell: bash
+        env:
+          DISPATCH_TAG: ${{ inputs.tag }}
+        run: |
+          release_tag="$DISPATCH_TAG"
+          if [[ ! "$release_tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]; then
+            echo "Release tag must be a semantic version such as v1.0.0 or v1.0.0-rc.1" >&2
+            exit 1
+          fi
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+
+  verify:
+    name: Verify source
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Run test suite
+        if: inputs.skip_tests != true
+        run: npm test
+
+      - name: Skip tests notice
+        if: inputs.skip_tests == true
+        run: echo "ℹ️ Automated tests skipped via skip flag."
+
+      - name: Build the bundles
+        run: npm run build
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: [prepare, verify]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64
+            runner: ubuntu-latest
+            platform: linux
+            arch: x64
+          - target: linux-arm64
+            runner: ubuntu-latest
+            platform: linux
+            arch: arm64
+          - target: win-x64
+            runner: windows-latest
+            platform: win32
+            arch: x64
+          - target: win-arm64
+            runner: windows-latest
+            platform: win32
+            arch: arm64
+          - target: macos-x64
+            runner: macos-13
+            platform: darwin
+            arch: x64
+          - target: macos-arm64
+            runner: macos-latest
+            platform: darwin
+            arch: arm64
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build the CLI bundle
+        run: npm run build
+
+      - name: Package the archive
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          PLATFORM: ${{ matrix.platform }}
+          ARCH: ${{ matrix.arch }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p "release/$TARGET"
+          cp dist/cli.js "release/$TARGET/opencode2api-proxy.js"
+          cp config.example.json "release/$TARGET/config.example.json"
+          cp README.md "release/$TARGET/README.md"
+          cp LICENSE "release/$TARGET/LICENSE"
+          if [[ "$PLATFORM" == "win32" ]]; then
+            cp package.json "release/$TARGET/package.json"
+          fi
+          cd "release/$TARGET"
+          zip -r "../opencode2api-proxy-$RELEASE_TAG-$TARGET.zip" . -q
+          cd ..
+          rm -rf "$TARGET"
+
+      - name: Upload the archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencode2api-proxy-${{ needs.prepare.outputs.release_tag }}-${{ matrix.target }}
+          path: release/opencode2api-proxy-*.zip
+          if-no-files-found: error
+
+  release:
+    name: Create the draft release
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download the archives
+        uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+          pattern: opencode2api-proxy-*
+
+      - name: List the archives
+        run: ls -la release
+
+      - name: Publish the draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+          DRAFT: ${{ inputs.draft }}
+        run: |
+          set -euo pipefail
+          draft_flag="--draft"
+          if [[ "$DRAFT" != "true" ]]; then
+            draft_flag=""
+          fi
+          gh release create "$RELEASE_TAG" \
+            release/*.zip \
+            --title "OpenCode2API-Proxy $RELEASE_TAG" \
+            --generate-notes \
+            $draft_flag

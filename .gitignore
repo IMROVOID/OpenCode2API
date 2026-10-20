@@ -1,0 +1,18 @@
+node_modules/
+dist/
+worker/worker.js
+release/
+*.log
+.env
+config.json
+config.json.bak
+config.json.tmp
+config.json.models.catalog.json
+config.json.models.dev.json
+config.json.rotation.json
+.refs/
+.DS_Store
+
+# Tooling directories that are not part of the project.
+.mimocode/
+.agents/

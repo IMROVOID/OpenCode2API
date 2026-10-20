@@ -1,0 +1,51 @@
+{
+  "name": "opencode2api-proxy",
+  "version": "1.0.0",
+  "description": "OpenCode Zen/Go to OpenAI, Anthropic and Responses API proxy router with a built-in control WebUI",
+  "type": "module",
+  "main": "./dist/cli.js",
+  "bin": {
+    "opencode2api-proxy": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "worker",
+    "config.example.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test tests/**/*.test.ts",
+    "build": "tsx scripts/build.ts",
+    "build:release": "tsx scripts/build-release.ts",
+    "prepublishOnly": "npm run typecheck && npm test && npm run build",
+    "start": "tsx src/cli/index.ts start"
+  },
+  "keywords": [
+    "opencode",
+    "openai",
+    "anthropic",
+    "openai-compatible",
+    "router",
+    "proxy",
+    "cloudflare-workers",
+    "reverse-proxy"
+  ],
+  "author": "IMROVOID",
+  "license": "GPL-3.0-or-later",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/IMROVOID/OpenCode2API-Proxy.git"
+  },
+  "bugs": {
+    "url": "https://github.com/IMROVOID/OpenCode2API-Proxy/issues"
+  },
+  "homepage": "https://github.com/IMROVOID/OpenCode2API-Proxy#readme",
+  "devDependencies": {
+    "@types/node": "^22.13.9",
+    "esbuild": "^0.25.0",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2"
+  }
+}
