@@ -1,6 +1,5 @@
 node_modules/
 dist/
-worker/worker.js
 release/
 *.log
 .env
