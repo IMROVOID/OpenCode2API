@@ -102,6 +102,30 @@ describe("unlimited lane (zen-lane)", () => {
 });
 
 describe("unlimited guard (zen-guard & zen-hop)", () => {
+  it("does not call crypto.getRandomValues during UnlimitedGuard construction (Cloudflare Worker global scope safety)", () => {
+    // Arrange
+    const originalGetRandomValues = crypto.getRandomValues.bind(crypto);
+    let randomCalledInConstructor = false;
+    crypto.getRandomValues = ((array: ArrayBufferView) => {
+      randomCalledInConstructor = true;
+      return originalGetRandomValues(array as Uint8Array);
+    }) as typeof crypto.getRandomValues;
+
+    try {
+      // Act
+      const guard = new UnlimitedGuard(["2606:4700:10::ac42:ad95"]);
+      // Assert: constructor must not touch crypto.getRandomValues
+      assert.equal(randomCalledInConstructor, false);
+
+      // Calling current() inside a handler lazily initializes the identity
+      const lane = guard.current();
+      assert.equal(randomCalledInConstructor, true);
+      assert.equal(lane.edge, "2606:4700:10::ac42:ad95");
+    } finally {
+      crypto.getRandomValues = originalGetRandomValues;
+    }
+  });
+
   it("detects quota walls from status and body text", () => {
     // Arrange & Act & Assert
     assert.equal(isQuotaWall(429, ""), true);

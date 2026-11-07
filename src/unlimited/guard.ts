@@ -54,7 +54,7 @@ export class UnlimitedGuard {
   private lastHop = 0;
   private hops = 0;
   private pool: string[];
-  private activeLane: LaneIdentity;
+  private activeLane: LaneIdentity | undefined;
   private readonly scope: string;
 
   constructor(
@@ -64,11 +64,18 @@ export class UnlimitedGuard {
     this.scope = scope;
     this.pool =
       initialPool.length > 0 ? [...initialPool] : [...DEFAULT_AAAA_POOL];
-    this.activeLane = createLaneIdentity(this.scope, this.pool[0] ?? DEFAULT_AAAA_POOL[0]);
   }
 
-  // current returns the active lane identity and edge.
+  // current returns the active lane identity and edge, lazily initializing it
+  // inside a request handler so Cloudflare Workers global scope never calls
+  // crypto.getRandomValues().
   current(): LaneIdentity {
+    if (this.activeLane === undefined) {
+      this.activeLane = createLaneIdentity(
+        this.scope,
+        this.pool[0] ?? DEFAULT_AAAA_POOL[0],
+      );
+    }
     return this.activeLane;
   }
 
@@ -113,7 +120,7 @@ export class UnlimitedGuard {
     nowSeconds: number = Math.floor(Date.now() / 1000),
   ): LaneIdentity {
     if (burnCurrent) {
-      this.blacklistAdd(this.activeLane.edge);
+      this.blacklistAdd(this.current().edge);
     }
     const effectivePool =
       candidatePool !== undefined && candidatePool.length > 0
@@ -156,7 +163,7 @@ export class UnlimitedGuard {
   async executeWithGuard<T>(
     attemptFn: (lane: LaneIdentity, attempt: number) => Promise<GuardAttemptResult<T>>,
   ): Promise<GuardAttemptResult<T>> {
-    let lane = this.activeLane;
+    let lane = this.current();
     let lastResult = await attemptFn(lane, 1);
     if (!isQuotaWall(lastResult.status, lastResult.bodyPreview)) {
       return lastResult;
@@ -175,14 +182,15 @@ export class UnlimitedGuard {
 
   // snapshot returns an immutable copy of the guard's state.
   snapshot(): GuardSnapshot {
+    const active = this.current();
     return {
       blacklist: [...this.blacklist],
       lastHop: this.lastHop,
       hops: this.hops,
-      currentEdge: this.activeLane.edge,
-      currentPrefix64: this.activeLane.prefix64,
-      currentSession: this.activeLane.ids.session,
-      currentMachineId: this.activeLane.machineId,
+      currentEdge: active.edge,
+      currentPrefix64: active.prefix64,
+      currentSession: active.ids.session,
+      currentMachineId: active.machineId,
       pool: [...this.pool],
     };
   }
