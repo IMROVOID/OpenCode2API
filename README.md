@@ -509,8 +509,9 @@ curl -X POST http://127.0.0.1:8080/v1/unlimited/hop \
 | `npm run typecheck` | Run TypeScript compiler type checking (`tsc --noEmit`) |
 | `npm test` | Run automated unit and integration test suite (`tsx --test tests/**/*.test.ts`) |
 | `npm run build` | Bundle standalone CLI (`dist/cli.js`) and Cloudflare Worker (`worker/worker.js`) |
+| `npm run verify:worker` | Verify `worker/worker.js` in a Cloudflare Workers global-scope sandbox and run handler smoke tests |
 | `npm run build:release` | Build cross-platform release ZIP archives into `release/` |
-| `npm run prepublishOnly` | Run typecheck, tests, and bundle build before publishing |
+| `npm run prepublishOnly` | Run typecheck, tests, bundle build, and Worker verification before publishing |
 | `npm start` | Start the local proxy daemon directly from TypeScript source |
 <!-- /AUTO-GENERATED:SCRIPTS -->
 

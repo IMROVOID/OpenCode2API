@@ -40,27 +40,36 @@ export interface HopResponse {
   readonly blacklisted_count: number;
 }
 
-// Shared Worker-scoped guard instance across warm invocations.
-export const workerGuard = new UnlimitedGuard(DEFAULT_AAAA_POOL, "worker");
+// Lazily initialized Worker-scoped guard instance (never constructed in global scope).
+let workerGuardInstance: UnlimitedGuard | undefined;
+
+export function getWorkerGuard(): UnlimitedGuard {
+  if (workerGuardInstance === undefined) {
+    workerGuardInstance = new UnlimitedGuard(DEFAULT_AAAA_POOL, "worker");
+  }
+  return workerGuardInstance;
+}
 
 // handleWorkerDoctor returns the DoctorReport for the Cloudflare Worker.
 export async function handleWorkerDoctor(
   fetchImpl: typeof fetch = fetch,
 ): Promise<DoctorReport> {
+  const guard = getWorkerGuard();
   const pool = await resolveEdgePool(fetchImpl);
-  workerGuard.setPool(pool);
-  return buildDoctorReport(workerGuard, fetchImpl, "cloudflare-worker");
+  guard.setPool(pool);
+  return buildDoctorReport(guard, fetchImpl, "cloudflare-worker");
 }
 
 // handleWorkerHop rotates the active Worker edge and identity immediately.
 export async function handleWorkerHop(
   fetchImpl: typeof fetch = fetch,
 ): Promise<HopResponse> {
-  const oldEdge = workerGuard.current().edge;
+  const guard = getWorkerGuard();
+  const oldEdge = guard.current().edge;
   const pool = await resolveEdgePool(fetchImpl);
-  workerGuard.setPool(pool);
-  const rotated = workerGuard.hop(pool, true);
-  const snap = workerGuard.snapshot();
+  guard.setPool(pool);
+  const rotated = guard.hop(pool, true);
+  const snap = guard.snapshot();
   return {
     status: "rotated",
     old_edge: oldEdge,
@@ -121,10 +130,11 @@ export async function forwardWithUnlimitedGuard(
   corsHeaders: Record<string, string>,
   fetchImpl: typeof fetch = fetch,
 ): Promise<Response> {
+  const guard = getWorkerGuard();
   const candidates = collectCandidates(env);
   const rawBody = JSON.stringify(payload);
 
-  const guarded = await workerGuard.executeWithGuard(async (lane, attempt) => {
+  const guarded = await guard.executeWithGuard(async (lane, attempt) => {
     const activeIDs = attempt === 1 ? initialIDs : lane.ids;
     const candidate =
       candidates[(attempt - 1) % candidates.length] ?? {
@@ -178,7 +188,7 @@ export async function forwardWithUnlimitedGuard(
   const headers = new Headers(response.headers);
   headers.set("x-request-id", ids.request);
   headers.set("x-opencode-edge", edge);
-  headers.set("x-opencode-hops", String(workerGuard.snapshot().hops));
+  headers.set("x-opencode-hops", String(guard.snapshot().hops));
   for (const [name, value] of Object.entries(corsHeaders)) {
     headers.set(name, value);
   }

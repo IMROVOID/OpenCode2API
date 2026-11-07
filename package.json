@@ -18,8 +18,9 @@
     "typecheck": "tsc --noEmit",
     "test": "tsx --test tests/**/*.test.ts",
     "build": "tsx scripts/build.ts",
+    "verify:worker": "tsx scripts/verify-worker.ts",
     "build:release": "tsx scripts/build-release.ts",
-    "prepublishOnly": "npm run typecheck && npm test && npm run build",
+    "prepublishOnly": "npm run typecheck && npm test && npm run build && npm run verify:worker",
     "start": "tsx src/cli/index.ts start"
   },
   "keywords": [

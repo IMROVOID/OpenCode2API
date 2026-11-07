@@ -47,6 +47,7 @@ jobs:
 
   verify:
     name: Verify source
+    needs: [prepare]
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
@@ -74,6 +75,16 @@ jobs:
 
       - name: Build the bundles
         run: npm run build
+
+      - name: Verify Cloudflare Worker bundle
+        run: npm run verify:worker
+
+      - name: Upload verified worker.js asset
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencode2api-proxy-${{ needs.prepare.outputs.release_tag }}-worker
+          path: worker/worker.js
+          if-no-files-found: error
 
   build:
     name: Build ${{ matrix.target }}
@@ -181,6 +192,7 @@ jobs:
           fi
           gh release create "$RELEASE_TAG" \
             release/*.zip \
+            release/worker.js \
             --title "OpenCode2API-Proxy $RELEASE_TAG" \
             --generate-notes \
             $draft_flag

@@ -2722,18 +2722,26 @@ var DEFAULT_ZEN = "https://opencode.ai/zen";
 var DEFAULT_GO = "https://opencode.ai/zen/go";
 var DEFAULT_ANONYMOUS = "https://opencode.ai/inference";
 var ANONYMOUS_TOKEN = "public";
-var workerGuard = new UnlimitedGuard(DEFAULT_AAAA_POOL, "worker");
+var workerGuardInstance;
+function getWorkerGuard() {
+  if (workerGuardInstance === void 0) {
+    workerGuardInstance = new UnlimitedGuard(DEFAULT_AAAA_POOL, "worker");
+  }
+  return workerGuardInstance;
+}
 async function handleWorkerDoctor(fetchImpl = fetch) {
+  const guard = getWorkerGuard();
   const pool = await resolveEdgePool(fetchImpl);
-  workerGuard.setPool(pool);
-  return buildDoctorReport(workerGuard, fetchImpl, "cloudflare-worker");
+  guard.setPool(pool);
+  return buildDoctorReport(guard, fetchImpl, "cloudflare-worker");
 }
 async function handleWorkerHop(fetchImpl = fetch) {
-  const oldEdge = workerGuard.current().edge;
+  const guard = getWorkerGuard();
+  const oldEdge = guard.current().edge;
   const pool = await resolveEdgePool(fetchImpl);
-  workerGuard.setPool(pool);
-  const rotated = workerGuard.hop(pool, true);
-  const snap = workerGuard.snapshot();
+  guard.setPool(pool);
+  const rotated = guard.hop(pool, true);
+  const snap = guard.snapshot();
   return {
     status: "rotated",
     old_edge: oldEdge,
@@ -2771,9 +2779,10 @@ function parseKeys(value) {
   return value.split(",").map((item) => item.trim()).filter((item) => item !== "");
 }
 async function forwardWithUnlimitedGuard(env, protocol, payload, initialIDs, corsHeaders, fetchImpl = fetch) {
+  const guard = getWorkerGuard();
   const candidates = collectCandidates(env);
   const rawBody = JSON.stringify(payload);
-  const guarded = await workerGuard.executeWithGuard(async (lane, attempt) => {
+  const guarded = await guard.executeWithGuard(async (lane, attempt) => {
     const activeIDs = attempt === 1 ? initialIDs : lane.ids;
     const candidate = candidates[(attempt - 1) % candidates.length] ?? {
       baseURL: DEFAULT_ZEN,
@@ -2823,7 +2832,7 @@ async function forwardWithUnlimitedGuard(env, protocol, payload, initialIDs, cor
   const headers = new Headers(response.headers);
   headers.set("x-request-id", ids.request);
   headers.set("x-opencode-edge", edge);
-  headers.set("x-opencode-hops", String(workerGuard.snapshot().hops));
+  headers.set("x-opencode-hops", String(guard.snapshot().hops));
   for (const [name, value] of Object.entries(corsHeaders)) {
     headers.set(name, value);
   }

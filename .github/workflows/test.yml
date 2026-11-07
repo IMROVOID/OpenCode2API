@@ -14,16 +14,18 @@ on:
         default: false
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   test:
-    name: Run Automated Tests
+    name: Build, Test & Publish Worker
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Node.js 22
         uses: actions/setup-node@v4
@@ -63,7 +65,7 @@ jobs:
           contains(github.event.pull_request.title, '[skip-tests]')
         run: echo "ℹ️ Automated tests skipped via skip flag."
 
-      - name: Verify build bundles
+      - name: Build CLI and Cloudflare Worker bundles
         run: npm run build
 
       - name: Verify CLI executable
@@ -71,10 +73,26 @@ jobs:
           node dist/cli.js --version
           node dist/cli.js --help
 
-      - name: Verify the Worker bundle carries no Node built-ins
+      - name: Verify Cloudflare Worker bundle (global-scope sandbox & handler smoke tests)
+        run: npm run verify:worker
+
+      - name: Upload verified Cloudflare Worker artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencode2api-cloudflare-worker
+          path: worker/worker.js
+          if-no-files-found: error
+
+      - name: Publish verified worker/worker.js to branch
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
         run: |
-          if grep -q "node:" worker/worker.js; then
-            echo "❌ The Worker bundle references a Node built-in."
-            exit 1
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add worker/worker.js
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(worker): publish verified worker/worker.js bundle [skip ci]"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+            echo "✓ Published updated worker/worker.js to ${GITHUB_REF_NAME}."
+          else
+            echo "✓ worker/worker.js is already up to date on ${GITHUB_REF_NAME}."
           fi
-          echo "✓ Worker bundle is free of Node built-ins."
