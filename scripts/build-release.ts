@@ -12,8 +12,9 @@ const TARGETS = [
   { target: "macos-arm64", platform: "darwin", arch: "arm64" },
 ];
 
-// The version the archives are named after.
-const VERSION = "1.0.0";
+// The version the archives are named after. Reads from package.json or environment.
+const pkgJson = JSON.parse(await readFile("package.json", "utf-8"));
+const VERSION = process.env.RELEASE_TAG?.replace(/^v/, "") || pkgJson.version || "1.0.0";
 
 // buildRelease bundles the CLI for every target and writes the archives. Each
 // archive holds the executable, an example configuration the user renames to

@@ -146,38 +146,10 @@ jobs:
           if-no-files-found: error
 
   build:
-    name: Build ${{ matrix.target }}
+    name: Build platform packages
     needs: [prepare, verify]
     if: needs.prepare.outputs.should_run == 'true'
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: linux-x64
-            runner: ubuntu-latest
-            platform: linux
-            arch: x64
-          - target: linux-arm64
-            runner: ubuntu-latest
-            platform: linux
-            arch: arm64
-          - target: win-x64
-            runner: windows-latest
-            platform: win32
-            arch: x64
-          - target: win-arm64
-            runner: windows-latest
-            platform: win32
-            arch: arm64
-          - target: macos-x64
-            runner: macos-13
-            platform: darwin
-            arch: x64
-          - target: macos-arm64
-            runner: macos-latest
-            platform: darwin
-            arch: arm64
+    runs-on: ubuntu-latest
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -191,36 +163,22 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Build the CLI bundle
+      - name: Build bundles
         run: npm run build
 
-      - name: Package the archive
-        shell: bash
+      - name: Package all platform release archives
         env:
-          TARGET: ${{ matrix.target }}
-          PLATFORM: ${{ matrix.platform }}
-          ARCH: ${{ matrix.arch }}
           RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
-        run: |
-          set -euo pipefail
-          mkdir -p "release/$TARGET"
-          cp dist/cli.js "release/$TARGET/opencode2api-proxy.js"
-          cp config.example.json "release/$TARGET/config.example.json"
-          cp README.md "release/$TARGET/README.md"
-          cp LICENSE "release/$TARGET/LICENSE"
-          if [[ "$PLATFORM" == "win32" ]]; then
-            cp package.json "release/$TARGET/package.json"
-          fi
-          cd "release/$TARGET"
-          zip -r "../opencode2api-proxy-$RELEASE_TAG-$TARGET.zip" . -q
-          cd ..
-          rm -rf "$TARGET"
+        run: npm run build:release
 
-      - name: Upload the archive
+      - name: Copy standalone Cloudflare Worker bundle
+        run: cp worker/worker.js release/worker.js
+
+      - name: Upload release archives
         uses: actions/upload-artifact@v4
         with:
-          name: opencode2api-proxy-${{ needs.prepare.outputs.release_tag }}-${{ matrix.target }}
-          path: release/opencode2api-proxy-*.zip
+          name: opencode2api-proxy-${{ needs.prepare.outputs.release_tag }}-packages
+          path: release/*
           if-no-files-found: error
 
   release:
