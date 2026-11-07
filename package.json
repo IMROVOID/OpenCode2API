@@ -1,6 +1,6 @@
 {
   "name": "opencode2api-proxy",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "OpenCode Zen/Go to OpenAI, Anthropic and Responses API proxy router with a built-in control WebUI",
   "type": "module",
   "main": "./dist/cli.js",
