@@ -1,6 +1,6 @@
 import {
   ascendingID,
-  canonicalSessionID,
+  mintFreshSessionID,
   randomID,
   type RequestIDs,
 } from "../protocol/identity.js";
@@ -111,7 +111,7 @@ export function createLaneIdentity(
   const seed = `${scope}\0${randomID("lane", 16)}`;
   const projectDigest = sha256Bytes(`opencode-project\0${seed}`);
   const ids: RequestIDs = {
-    session: canonicalSessionID(seed),
+    session: mintFreshSessionID(),
     request: randomID("req", 16),
     message: ascendingID("msg"),
     project: toHex(projectDigest.subarray(0, 20)),

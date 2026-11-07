@@ -75,7 +75,7 @@ export function v2Tool(protocol: Protocol, name: string): Record<string, unknown
   if (protocol === "chat") {
     return {
       type: "function",
-      function: { name, description, parameters },
+      function: { name, description, parameters, strict: false },
     };
   }
   if (protocol === "anthropic") {
@@ -265,16 +265,32 @@ export function ensureV2Tools(
   payload: Record<string, unknown>,
   protocol: Protocol,
 ): boolean {
+  let changed = false;
+  if (protocol === "chat") {
+    if (payload.tool_choice === "none") {
+      delete payload.tool_choice;
+      changed = true;
+    }
+    if (payload.max_tokens !== undefined) {
+      if (payload.max_completion_tokens === undefined) {
+        payload.max_completion_tokens = payload.max_tokens;
+      }
+      delete payload.max_tokens;
+      changed = true;
+    } else if (payload.max_completion_tokens === undefined) {
+      payload.max_completion_tokens = 32000;
+      changed = true;
+    }
+  }
   const raw = payload.tools;
   if (raw === undefined) {
     payload.tools = v2Toolset(protocol);
     return true;
   }
   if (!Array.isArray(raw)) {
-    return false;
+    return changed;
   }
   const items = raw as unknown[];
-  let changed = false;
   const present = new Set<string>();
   for (const [index, item] of items.entries()) {
     const name = toolName(protocol, item);

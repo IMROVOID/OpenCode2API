@@ -4,7 +4,7 @@ import { protocolPath } from "./paths.js";
 
 // The user agents the upstream gates fingerprint. The v1 lane reports the AI
 // SDK package that serves the protocol, the v2 lane reports the CLI.
-export const V2_USER_AGENT = "opencode/latest/2.0.32/cli";
+export const V2_USER_AGENT = "opencode/latest/2.2.5/cli";
 
 export const V1_RESPONSES_SDK = "4.0.40";
 export const V1_ANTHROPIC_SDK = "4.0.46";
@@ -47,5 +47,10 @@ export function tierBaseURL(
 
 // upstreamURL builds the URL of an upstream endpoint.
 export function upstreamURL(baseURL: string, protocol: Protocol): string {
-  return baseURL.replace(/\/+$/, "") + protocolPath(protocol);
+  const trimmed = baseURL.replace(/\/+$/, "");
+  if (trimmed.toLowerCase().endsWith("/inference")) {
+    const family = protocol === "anthropic" ? "/anthropic" : "/openai";
+    return `${trimmed}${family}${protocolPath(protocol)}`;
+  }
+  return trimmed + protocolPath(protocol);
 }

@@ -9,6 +9,7 @@ import type { Metrics } from "../telemetry/metrics.js";
 import type { UpstreamAttemptRecord } from "../types/inference.js";
 import { keyDisplayId } from "../config/secrets.js";
 import { buildEdgeFetchInit } from "../unlimited/lane.js";
+import { KILO_ANONYMOUS_TOKEN, KILO_GATEWAY_BASE } from "../unlimited/kilo.js";
 import {
   type UpstreamResponse,
 } from "./upstream-client.js";
@@ -73,12 +74,8 @@ export async function sendRequest(
   key: string,
   timeoutSeconds: number,
   edge = "",
-  machineId = "",
 ): Promise<UpstreamResponse> {
   const request = buildUpstreamRequest(baseURL, protocol, body, ids, key);
-  if (machineId !== "") {
-    request.headers.set("x-opencode-machine-id", machineId);
-  }
   const controller = new AbortController();
   const timer = setTimeout(
     () => {
@@ -118,15 +115,14 @@ export function shapeBody(
 }
 
 // anonymousUpstreams lists the lanes the anonymous phase tries, in order. The
-// v1 /zen lane comes first, because the two gates accept different request
-// shapes.
+// v2 /inference lane comes first, followed by the v1 /zen lane.
 export function anonymousUpstreams(lanes: UpstreamLanes): string[] {
   const v1 = V1_BASE.replace(/\/+$/, "");
   const primary = lanes.anonymous.replace(/\/+$/, "");
   if (primary === "" || primary.toLowerCase() === v1.toLowerCase()) {
     return [v1];
   }
-  return [v1, primary];
+  return [primary, v1];
 }
 
 // outcomeFor classifies the result of one attempt.
@@ -210,6 +206,67 @@ export function buildAttemptRecord(
   };
   metrics.recordAttempt({ ...record });
   return record;
+}
+
+// attemptKiloAnonymous performs one keyless attempt against the Kilo Free Gateway.
+export async function attemptKiloAnonymous(
+  metrics: Metrics,
+  timeoutSeconds: number,
+  body: string,
+  ids: RequestIDs,
+  requestID: string,
+  model: string,
+  kiloModel: string,
+): Promise<AttemptOutcome> {
+  let payload: Record<string, unknown> = {};
+  try {
+    const parsed = JSON.parse(body) as unknown;
+    if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+      payload = { ...(parsed as Record<string, unknown>), model: kiloModel, stream: true };
+    }
+  } catch {
+    // Keep original body if invalid JSON.
+  }
+  const kiloBody = Object.keys(payload).length > 0 ? JSON.stringify(payload) : body;
+  const started = Date.now();
+  let response: UpstreamResponse | undefined;
+  let error: Error | undefined;
+  try {
+    response = await sendRequest(
+      KILO_GATEWAY_BASE,
+      "chat",
+      kiloBody,
+      ids,
+      KILO_ANONYMOUS_TOKEN,
+      timeoutSeconds,
+      "",
+    );
+  } catch (caught) {
+    error = caught instanceof Error ? caught : new Error(String(caught));
+  }
+  const durationMs = Date.now() - started;
+  const status = response?.status ?? 0;
+  const record = buildAttemptRecord(metrics, {
+    requestID,
+    model,
+    tier: "zen",
+    attempt: 1,
+    keyID: "kilo-anonymous",
+    channel: "anonymous",
+    anonymous: true,
+    proxyNode: "kilo",
+    status,
+    durationMs,
+    error,
+  });
+  return {
+    response,
+    error,
+    attempts: 1,
+    records: [record],
+    alias: "",
+    shaped: true,
+  };
 }
 
 export type { Logger, Metrics, UpstreamAttemptRecord };

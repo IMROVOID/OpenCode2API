@@ -296,7 +296,43 @@ describe("Cloudflare Worker unlimited endpoints & forwarding", () => {
     assert.equal(response.status, 200);
     assert.equal(attempts, 2);
     assert.equal(seenAuth[0], "Bearer public");
+    assert.equal(seenAuth[1], "Bearer anonymous");
     assert.equal(body["id"], "chatcmpl_ok");
     assert.equal(typeof response.headers.get("x-opencode-edge"), "string");
+  });
+
+  it("collapses SSE stream into JSON when downstream requests stream: false", async () => {
+    // Arrange
+    const ssePayload = [
+      'data: {"id":"chatcmpl_sse","object":"chat.completion.chunk","created":1794000000,"model":"beam-free","choices":[{"index":0,"delta":{"role":"assistant","content":"Hello "},"finish_reason":null}]}',
+      "",
+      'data: {"id":"chatcmpl_sse","object":"chat.completion.chunk","created":1794000000,"model":"beam-free","choices":[{"index":0,"delta":{"content":"world"},"finish_reason":"stop"}]}',
+      "",
+      "data: [DONE]",
+      "",
+    ].join("\n");
+    const mockFetch: typeof fetch = async () =>
+      new Response(ssePayload, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      });
+    const initial = createLaneIdentity("worker").ids;
+
+    // Act
+    const response = await forwardWithUnlimitedGuard(
+      {},
+      "chat",
+      { model: "beam-free", stream: false, messages: [{ role: "user", content: "hi" }] },
+      initial,
+      {},
+      mockFetch,
+    );
+    const body = (await response.json()) as Record<string, unknown>;
+    const choices = body["choices"] as Record<string, unknown>[];
+    const msg = choices[0]?.["message"] as Record<string, unknown>;
+
+    // Assert
+    assert.equal(response.status, 200);
+    assert.equal(msg["content"], "Hello world");
   });
 });

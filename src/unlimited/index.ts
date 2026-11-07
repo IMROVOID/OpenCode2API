@@ -22,3 +22,13 @@ export {
   type DoctorReport,
   type EgressStatus,
 } from "./doctor.js";
+export {
+  BUILTIN_FREE_MODELS,
+  KILO_ANONYMOUS_TOKEN,
+  KILO_GATEWAY_BASE,
+  buildKiloUpstreamRequest,
+  isKiloModelId,
+  kiloFallbackChain,
+  normalizeUnlimitedResponse,
+  resolveOpenCodeFreeModel,
+} from "./kilo.js";

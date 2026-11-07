@@ -1,7 +1,9 @@
 import type { Protocol } from "../types/config.js";
 import { canonicalSessionID, randomID, type RequestIDs } from "../protocol/identity.js";
+import { V2_USER_AGENT } from "../protocol/lanes.js";
 import { deriveRequestIDs } from "../protocol/request-identity.js";
 import { buildErrorEnvelope } from "../protocol/error.js";
+import { BUILTIN_FREE_MODELS } from "../unlimited/index.js";
 import { WEBUI_HTML } from "../webui/document.js";
 import {
   forwardWithUnlimitedGuard,
@@ -17,6 +19,7 @@ export interface WorkerEnv {
   UPSTREAM_ZEN?: string;
   UPSTREAM_GO?: string;
   UPSTREAM_ANONYMOUS?: string;
+  UPSTREAM_KILO?: string;
   ADMIN_PASSWORD?: string;
   WEBUI_ENABLED?: string;
 }
@@ -195,29 +198,44 @@ function webuiEnabled(env: WorkerEnv): boolean {
   return (env.WEBUI_ENABLED ?? "true").toLowerCase() !== "false";
 }
 
-// modelsResponse lists the models of the configured lane.
+// modelsResponse lists the models of the configured lane plus built-in free lanes.
 async function modelsResponse(env: WorkerEnv): Promise<Response> {
   const tier = pickTier(env);
   const baseURL = baseURLFor(env, tier);
   const configuredKey =
     tier === "go" ? firstKey(env.OPENCODE_GO_KEYS) : firstKey(env.OPENCODE_ZEN_KEYS);
   const key = configuredKey !== "" ? configuredKey : ANONYMOUS_CREDENTIAL;
+  const seen = new Set<string>(BUILTIN_FREE_MODELS);
   try {
     const response = await fetch(`${baseURL.replace(/\/+$/, "")}/v1/models`, {
       headers: {
         Authorization: `Bearer ${key}`,
-        "User-Agent": "opencode/latest/2.0.32/cli",
+        "User-Agent": V2_USER_AGENT,
         "x-opencode-client": "cli",
       },
     });
-    if (!response.ok) {
-      return jsonResponse({ error: { message: "models endpoint failed" } }, 502);
+    if (response.ok) {
+      const payload = (await response.json()) as Record<string, unknown>;
+      const rawData = Array.isArray(payload["data"]) ? payload["data"] : [];
+      for (const item of rawData) {
+        if (typeof item === "object" && item !== null) {
+          const id = (item as Record<string, unknown>)["id"];
+          if (typeof id === "string" && id.trim() !== "") {
+            seen.add(id.trim());
+          }
+        }
+      }
     }
-    const payload = (await response.json()) as unknown;
-    return jsonResponse(payload);
   } catch {
-    return jsonResponse({ error: { message: "models endpoint unreachable" } }, 502);
+    // Fall back to BUILTIN_FREE_MODELS when upstream /v1/models is unreachable.
   }
+  const data = [...seen].map((id) => ({
+    id,
+    object: "model",
+    created: 0,
+    owned_by: id.includes("/") ? "kilo" : "opencode",
+  }));
+  return jsonResponse({ object: "list", data });
 }
 
 // protocolFor returns the protocol a path serves.

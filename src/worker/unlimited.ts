@@ -1,15 +1,23 @@
 import type { Protocol } from "../types/config.js";
 import type { RequestIDs } from "../protocol/identity.js";
+import { boolAt } from "../protocol/json-util.js";
 import { isV1Upstream } from "../protocol/lanes.js";
 import { prepareAnonymousBody } from "../protocol/tools.js";
 import { buildUpstreamRequest } from "../protocol/upstream-request.js";
 import {
   DEFAULT_AAAA_POOL,
+  KILO_ANONYMOUS_TOKEN,
+  KILO_GATEWAY_BASE,
   UnlimitedGuard,
   buildDoctorReport,
   buildEdgeFetchInit,
+  buildKiloUpstreamRequest,
+  isKiloModelId,
   isQuotaWall,
+  kiloFallbackChain,
+  normalizeUnlimitedResponse,
   resolveEdgePool,
+  resolveOpenCodeFreeModel,
   type DoctorReport,
 } from "../unlimited/index.js";
 
@@ -18,17 +26,15 @@ const DEFAULT_GO = "https://opencode.ai/zen/go";
 const DEFAULT_ANONYMOUS = "https://opencode.ai/inference";
 const ANONYMOUS_TOKEN = "public";
 
-// WorkerUnlimitedEnv is the subset of Worker environment variables used by the
-// unlimited lane and guard.
 export interface WorkerUnlimitedEnv {
   OPENCODE_ZEN_KEYS?: string;
   OPENCODE_GO_KEYS?: string;
   UPSTREAM_ZEN?: string;
   UPSTREAM_GO?: string;
   UPSTREAM_ANONYMOUS?: string;
+  UPSTREAM_KILO?: string;
 }
 
-// HopResponse is returned by POST /v1/unlimited/hop.
 export interface HopResponse {
   readonly status: "rotated";
   readonly old_edge: string;
@@ -40,7 +46,13 @@ export interface HopResponse {
   readonly blacklisted_count: number;
 }
 
-// Lazily initialized Worker-scoped guard instance (never constructed in global scope).
+export interface UpstreamCandidate {
+  readonly kind: "opencode" | "kilo";
+  readonly baseURL: string;
+  readonly key: string;
+  readonly modelOverride?: string | undefined;
+}
+
 let workerGuardInstance: UnlimitedGuard | undefined;
 
 export function getWorkerGuard(): UnlimitedGuard {
@@ -50,7 +62,6 @@ export function getWorkerGuard(): UnlimitedGuard {
   return workerGuardInstance;
 }
 
-// handleWorkerDoctor returns the DoctorReport for the Cloudflare Worker.
 export async function handleWorkerDoctor(
   fetchImpl: typeof fetch = fetch,
 ): Promise<DoctorReport> {
@@ -60,7 +71,6 @@ export async function handleWorkerDoctor(
   return buildDoctorReport(guard, fetchImpl, "cloudflare-worker");
 }
 
-// handleWorkerHop rotates the active Worker edge and identity immediately.
 export async function handleWorkerHop(
   fetchImpl: typeof fetch = fetch,
 ): Promise<HopResponse> {
@@ -82,30 +92,68 @@ export async function handleWorkerHop(
   };
 }
 
-interface UpstreamCandidate {
-  readonly baseURL: string;
-  readonly key: string;
-}
-
-// collectCandidates builds the ordered list of upstream targets (configured Go
-// keys, Zen keys, then anonymous v1/v2 lanes).
-export function collectCandidates(env: WorkerUnlimitedEnv): UpstreamCandidate[] {
+// collectCandidates builds the ordered list of upstream targets: configured Go
+// keys, Zen keys, OpenCode v2 anonymous lane, and Kilo Free Gateway failover.
+export function collectCandidates(
+  env: WorkerUnlimitedEnv,
+  requestedModel = "",
+): UpstreamCandidate[] {
   const goKeys = parseKeys(env.OPENCODE_GO_KEYS);
   const zenKeys = parseKeys(env.OPENCODE_ZEN_KEYS);
   const goBase = env.UPSTREAM_GO ?? DEFAULT_GO;
   const zenBase = env.UPSTREAM_ZEN ?? DEFAULT_ZEN;
   const anonBase = env.UPSTREAM_ANONYMOUS ?? DEFAULT_ANONYMOUS;
+  const kiloBase = env.UPSTREAM_KILO ?? KILO_GATEWAY_BASE;
   const candidates: UpstreamCandidate[] = [];
+
   for (const key of goKeys) {
-    candidates.push({ baseURL: goBase, key });
+    candidates.push({ kind: "opencode", baseURL: goBase, key });
   }
   for (const key of zenKeys) {
-    candidates.push({ baseURL: zenBase, key });
+    candidates.push({ kind: "opencode", baseURL: zenBase, key });
   }
-  // Always include anonymous lanes as fallback (or primary when keyless).
-  candidates.push({ baseURL: zenBase, key: ANONYMOUS_TOKEN });
-  if (anonBase.replace(/\/+$/, "").toLowerCase() !== zenBase.replace(/\/+$/, "").toLowerCase()) {
-    candidates.push({ baseURL: anonBase, key: ANONYMOUS_TOKEN });
+
+  const ocModel =
+    requestedModel !== "" ? resolveOpenCodeFreeModel(requestedModel) : undefined;
+  const kiloModels = kiloFallbackChain(requestedModel || "beam-free");
+
+  if (requestedModel !== "" && isKiloModelId(requestedModel)) {
+    for (const kiloModel of kiloModels) {
+      candidates.push({
+        kind: "kilo",
+        baseURL: kiloBase,
+        key: KILO_ANONYMOUS_TOKEN,
+        modelOverride: kiloModel,
+      });
+    }
+  }
+
+  candidates.push({
+    kind: "opencode",
+    baseURL: anonBase,
+    key: ANONYMOUS_TOKEN,
+    modelOverride: ocModel,
+  });
+
+  for (const kiloModel of kiloModels) {
+    candidates.push({
+      kind: "kilo",
+      baseURL: kiloBase,
+      key: KILO_ANONYMOUS_TOKEN,
+      modelOverride: kiloModel,
+    });
+  }
+
+  if (
+    anonBase.replace(/\/+$/, "").toLowerCase() !==
+    zenBase.replace(/\/+$/, "").toLowerCase()
+  ) {
+    candidates.push({
+      kind: "opencode",
+      baseURL: zenBase,
+      key: ANONYMOUS_TOKEN,
+      modelOverride: ocModel,
+    });
   }
   return candidates;
 }
@@ -121,7 +169,7 @@ function parseKeys(value: string | undefined): string[] {
 }
 
 // forwardWithUnlimitedGuard sends the completion request through the
-// self-healing guard, rotating edges and identities on QuotaExceeded/429.
+// self-healing guard, rotating across OpenCode v2 and Kilo Free lanes on 429.
 export async function forwardWithUnlimitedGuard(
   env: WorkerUnlimitedEnv,
   protocol: Protocol,
@@ -131,55 +179,65 @@ export async function forwardWithUnlimitedGuard(
   fetchImpl: typeof fetch = fetch,
 ): Promise<Response> {
   const guard = getWorkerGuard();
-  const candidates = collectCandidates(env);
-  const rawBody = JSON.stringify(payload);
+  const requestedModel =
+    typeof payload["model"] === "string" ? payload["model"] : "beam-free";
+  const clientWantsStream = boolAt(payload, "stream") === true;
+  const candidates = collectCandidates(env, requestedModel);
 
   const guarded = await guard.executeWithGuard(async (lane, attempt) => {
     const activeIDs = attempt === 1 ? initialIDs : lane.ids;
-    const candidate =
-      candidates[(attempt - 1) % candidates.length] ?? {
-        baseURL: DEFAULT_ZEN,
-        key: ANONYMOUS_TOKEN,
-      };
-    const shaped = prepareAnonymousBody(
-      rawBody,
+    const candidate = candidates[(attempt - 1) % candidates.length] ?? {
+      kind: "opencode" as const,
+      baseURL: DEFAULT_ANONYMOUS,
+      key: ANONYMOUS_TOKEN,
+    };
+
+    const { request, upstreamProtocol, alias } = prepareCandidateRequest(
+      candidate,
       protocol,
-      isV1Upstream(candidate.baseURL),
-    );
-    const upstream = buildUpstreamRequest(
-      candidate.baseURL,
-      protocol,
-      shaped.body,
+      payload,
       activeIDs,
-      candidate.key,
+      clientWantsStream,
     );
-    upstream.headers.set("x-opencode-machine-id", lane.machineId);
-    const init = buildEdgeFetchInit(
-      {
-        method: "POST",
-        headers: upstream.headers,
-        body: upstream.body,
-      },
-      lane.edge,
-    );
-    const response = await fetchImpl(upstream.url, init);
+    const init =
+      candidate.kind === "opencode"
+        ? buildEdgeFetchInit(
+            { method: "POST", headers: request.headers, body: request.body },
+            lane.edge,
+          )
+        : { method: "POST", headers: request.headers, body: request.body };
+
+    const response = await fetchImpl(request.url, init);
     if (response.status >= 200 && response.status < 300) {
+      const normalized = await normalizeUnlimitedResponse(
+        response,
+        upstreamProtocol,
+        protocol,
+        requestedModel,
+        alias,
+        clientWantsStream,
+      );
       return {
-        status: response.status,
+        status: normalized.status,
         bodyPreview: "",
-        value: { response, ids: activeIDs, edge: lane.edge },
+        value: { response: normalized, ids: activeIDs, edge: lane.edge },
       };
     }
     const errorText = await response.text();
+    const shouldRotate =
+      isQuotaWall(response.status, errorText) ||
+      (candidate.key === ANONYMOUS_TOKEN &&
+        (response.status === 400 ||
+          response.status === 401 ||
+          response.status === 403 ||
+          response.status === 404));
     const rebuilt = new Response(errorText, {
       status: response.status,
       headers: response.headers,
     });
     return {
-      status: response.status,
-      bodyPreview: isQuotaWall(response.status, errorText)
-        ? errorText || "QuotaExceeded"
-        : errorText,
+      status: shouldRotate ? 429 : response.status,
+      bodyPreview: shouldRotate ? errorText || "QuotaExceeded" : errorText,
       value: { response: rebuilt, ids: activeIDs, edge: lane.edge },
     };
   });
@@ -193,4 +251,52 @@ export async function forwardWithUnlimitedGuard(
     headers.set(name, value);
   }
   return new Response(response.body, { status: response.status, headers });
+}
+
+function prepareCandidateRequest(
+  candidate: UpstreamCandidate,
+  protocol: Protocol,
+  payload: Record<string, unknown>,
+  ids: RequestIDs,
+  clientWantsStream: boolean,
+): {
+  request: ReturnType<typeof buildUpstreamRequest>;
+  upstreamProtocol: Protocol;
+  alias: string;
+} {
+  if (candidate.kind === "kilo") {
+    const kiloModel = candidate.modelOverride ?? "reflection/beam-free";
+    return {
+      request: buildKiloUpstreamRequest(
+        kiloModel,
+        protocol,
+        payload,
+        clientWantsStream,
+        candidate.baseURL,
+      ),
+      upstreamProtocol: "chat",
+      alias: "",
+    };
+  }
+  const effectivePayload =
+    candidate.modelOverride !== undefined && candidate.key === ANONYMOUS_TOKEN
+      ? { ...payload, model: candidate.modelOverride }
+      : payload;
+  const rawBody = JSON.stringify(effectivePayload);
+  const shaped = prepareAnonymousBody(
+    rawBody,
+    protocol,
+    isV1Upstream(candidate.baseURL),
+  );
+  return {
+    request: buildUpstreamRequest(
+      candidate.baseURL,
+      protocol,
+      shaped.body,
+      ids,
+      candidate.key,
+    ),
+    upstreamProtocol: protocol,
+    alias: shaped.alias,
+  };
 }

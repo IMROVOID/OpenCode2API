@@ -209,9 +209,24 @@ export function parseModels(body: string): string[] {
 // capabilitiesBodyLimit is the body limit the capability read enforces.
 export { CAPABILITIES_BODY_LIMIT, MODELS_BODY_LIMIT, DOCS_BODY_LIMIT };
 
-// isFreeModel is the name rule: a model whose ID contains "free" in any case.
+const EXTRA_FREE_MODELS = new Set([
+  "big-pickle",
+  "stealth/crouton-alpha",
+  "stealth/glyph-cluster",
+  "auto",
+  "main",
+  "fast",
+  "deep",
+  "code",
+  "vision",
+  "vl",
+]);
+
+// isFreeModel is the name rule: a model whose ID contains "free" in any case
+// or belongs to the known keyless free model set.
 export function isFreeModel(model: string): boolean {
-  return model.toLowerCase().includes("free");
+  const lower = model.trim().toLowerCase();
+  return lower.includes("free") || EXTRA_FREE_MODELS.has(lower);
 }
 
 // nameDecision is the free-model decision taken from the name alone, used

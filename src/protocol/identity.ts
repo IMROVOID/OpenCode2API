@@ -84,6 +84,24 @@ export function ascendingID(prefix: string, now: number = Date.now()): string {
   return `${prefix}_${timePart}${randomBase62(14)}`;
 }
 
+// mintFreshSessionID formats an OpenCode v2.2.5 session identifier
+// (ses_<12-hex-inv-ts><14-base62>) encoding ~((now_ms << 12) | seq) & 0xffffffffffff.
+export function mintFreshSessionID(now: number = Date.now()): string {
+  const ms = BigInt(now);
+  if (ms !== ascendingLast) {
+    ascendingLast = ms;
+    ascendingCounter = 0n;
+  }
+  ascendingCounter = (ascendingCounter + 1n) & 0xfffn;
+  if (ascendingCounter === 0n) {
+    ascendingCounter = 1n;
+  }
+  const raw = (ms << 12n) | ascendingCounter;
+  const inverted = ~raw & 0xffffffffffffn;
+  const timePart = inverted.toString(16).padStart(12, "0");
+  return `ses_${timePart}${randomBase62(14)}`;
+}
+
 export function randomID(prefix: string, size: number): string {
   return `${prefix}_${toHex(randomBytes(size))}`;
 }

@@ -6,13 +6,18 @@ import type { Logger } from "../telemetry/logger.js";
 import type { Metrics } from "../telemetry/metrics.js";
 import type { UpstreamAttemptRecord } from "../types/inference.js";
 import { KeyPool } from "../auth/key-pool.js";
-import { DEFAULT_AAAA_POOL, UnlimitedGuard } from "../unlimited/index.js";
+import {
+  DEFAULT_AAAA_POOL,
+  UnlimitedGuard,
+  kiloFallbackChain,
+} from "../unlimited/index.js";
 import {
   ANONYMOUS_CREDENTIAL,
   type UpstreamResponse,
 } from "./upstream-client.js";
 import {
   anonymousUpstreams,
+  attemptKiloAnonymous,
   buildAttemptRecord,
   keyDisplayOf,
   parseRetryAfterHeader,
@@ -84,7 +89,6 @@ export class AttemptRunner {
           node.key,
           this.timeoutSeconds,
           lane.edge,
-          lane.machineId,
         );
       } catch (caught) {
         error = caught instanceof Error ? caught : new Error(String(caught));
@@ -200,7 +204,6 @@ export class AttemptRunner {
           requestID,
           model,
           lane.edge,
-          lane.machineId,
         );
         attempts += result.attempts;
         records.push(...result.records);
@@ -210,6 +213,29 @@ export class AttemptRunner {
             status: result.response.status,
             bodyPreview: "",
             value: result,
+          };
+        }
+      }
+      if (protocol === "chat") {
+        const kiloChain = kiloFallbackChain(model);
+        const kiloModel = kiloChain[(hopAttempt - 1) % kiloChain.length] ?? "reflection/beam-free";
+        const kiloResult = await attemptKiloAnonymous(
+          this.metrics,
+          this.timeoutSeconds,
+          body,
+          activeIDs,
+          requestID,
+          model,
+          kiloModel,
+        );
+        attempts += kiloResult.attempts;
+        records.push(...kiloResult.records);
+        lastOutcome = kiloResult;
+        if (kiloResult.response !== undefined && kiloResult.response.status < 300) {
+          return {
+            status: kiloResult.response.status,
+            bodyPreview: "",
+            value: kiloResult,
           };
         }
       }
@@ -241,7 +267,6 @@ export class AttemptRunner {
     requestID: string,
     model: string,
     edge: string,
-    machineId: string,
   ): Promise<AttemptOutcome> {
     const shaped = shapeBody(body, protocol, baseURL);
     const started = Date.now();
@@ -256,7 +281,6 @@ export class AttemptRunner {
         ANONYMOUS_CREDENTIAL,
         this.timeoutSeconds,
         edge,
-        machineId,
       );
     } catch (caught) {
       error = caught instanceof Error ? caught : new Error(String(caught));
