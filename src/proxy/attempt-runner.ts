@@ -6,14 +6,15 @@ import type { Logger } from "../telemetry/logger.js";
 import type { Metrics } from "../telemetry/metrics.js";
 import type { UpstreamAttemptRecord } from "../types/inference.js";
 import { KeyPool } from "../auth/key-pool.js";
+import { DEFAULT_AAAA_POOL, UnlimitedGuard } from "../unlimited/index.js";
 import {
   ANONYMOUS_CREDENTIAL,
   type UpstreamResponse,
 } from "./upstream-client.js";
 import {
   anonymousUpstreams,
+  buildAttemptRecord,
   keyDisplayOf,
-  outcomeFor,
   parseRetryAfterHeader,
   sendRequest,
   shapeBody,
@@ -24,6 +25,8 @@ import {
 // response. A 401, 403 or 429 rotates to the next key, and any other 4xx is
 // returned immediately because retrying it on another key cannot help.
 export class AttemptRunner {
+  readonly guard = new UnlimitedGuard(DEFAULT_AAAA_POOL, "gateway");
+
   constructor(
     private readonly pools: Record<Tier, KeyPool>,
     private readonly upstream: { zen: string; go: string; anonymous: string },
@@ -59,8 +62,6 @@ export class AttemptRunner {
     let attempts = 0;
     let lastResponse: UpstreamResponse | undefined;
     let lastError: Error | undefined;
-    // A key tier request is shaped like the anonymous one when the model is
-    // free, because the free-tier gate rejects the plain shape.
     const shaped = shapeBody(body, routeProtocol, baseURL);
     const sendBody = shaped.shaped ? shaped.body : body;
 
@@ -73,6 +74,7 @@ export class AttemptRunner {
       const started = Date.now();
       let response: UpstreamResponse | undefined;
       let error: Error | undefined;
+      const lane = this.guard.current();
       try {
         response = await sendRequest(
           baseURL,
@@ -81,47 +83,31 @@ export class AttemptRunner {
           ids,
           node.key,
           this.timeoutSeconds,
+          lane.edge,
+          lane.machineId,
         );
       } catch (caught) {
         error = caught instanceof Error ? caught : new Error(String(caught));
       }
       const durationMs = Date.now() - started;
       const status = response?.status ?? 0;
-      const success = error === undefined && status >= 200 && status < 300;
       const keyID = keyDisplayOf(node.key);
-      const record: UpstreamAttemptRecord = {
-        time: new Date().toISOString(),
-        request_id: requestID,
+      const record = buildAttemptRecord(this.metrics, {
+        requestID,
         model,
         tier,
         attempt: attempts,
-        key_id: keyID,
+        keyID,
         channel: "key",
         anonymous: false,
-        proxy_node: "",
+        proxyNode: lane.edge,
         status,
-        duration_ms: durationMs,
-        success,
-        outcome: success ? "success" : outcomeFor(status, error),
-      };
-      records.push(record);
-      this.metrics.recordAttempt({
-        time: record.time,
-        request_id: requestID,
-        model,
-        tier,
-        attempt: attempts,
-        key_id: keyID,
-        channel: "key",
-        anonymous: false,
-        proxy_node: "",
-        status,
-        duration_ms: durationMs,
-        success,
-        outcome: record.outcome,
+        durationMs,
+        error,
       });
+      records.push(record);
 
-      if (success) {
+      if (record.success) {
         pool.markSuccess(node);
         this.logger.debug("upstream accepted request", "upstream", {
           event: "attempt_succeeded",
@@ -142,8 +128,6 @@ export class AttemptRunner {
         };
       }
       if (response !== undefined && isNonRetryableClientResponse(status)) {
-        // A request-shape error is deterministic and must leave this tier
-        // without rotating through unrelated keys.
         this.logger.debug("upstream rejected a non-retryable request", "upstream", {
           event: "attempt_rejected",
           request_id: requestID,
@@ -161,6 +145,9 @@ export class AttemptRunner {
           alias: shaped.alias,
           shaped: shaped.shaped,
         };
+      }
+      if (status === 429) {
+        this.guard.hop(undefined, true);
       }
       pool.markFailure(
         node,
@@ -181,9 +168,8 @@ export class AttemptRunner {
     };
   }
 
-  // runAnonymous tries the anonymous lane with the shared public credential.
-  // The v1 /zen lane is tried first, then the v2 /inference lane, because the
-  // two gates accept different request shapes.
+  // runAnonymous tries the anonymous lane with the shared public credential
+  // and self-healing guard rotation on quota walls (429 / FreeTierError).
   async runAnonymous(
     protocol: Protocol,
     body: string,
@@ -193,44 +179,56 @@ export class AttemptRunner {
   ): Promise<AttemptOutcome> {
     const records: UpstreamAttemptRecord[] = [];
     const upstreams = anonymousUpstreams(this.upstream);
-    let lastResponse: UpstreamResponse | undefined;
-    let lastError: Error | undefined;
-    let lastAlias = "";
-    let lastShaped = false;
     let attempts = 0;
-    for (const baseURL of upstreams) {
-      const result = await this.attemptAnonymous(
-        baseURL,
-        protocol,
-        body,
-        ids,
-        requestID,
-        model,
-      );
-      attempts += result.attempts;
-      records.push(...result.records);
-      if (result.response !== undefined && result.response.status < 300) {
-        return {
-          response: result.response,
-          error: undefined,
-          attempts,
-          records,
-          alias: result.alias,
-          shaped: result.shaped,
-        };
+
+    const guarded = await this.guard.executeWithGuard(async (lane, hopAttempt) => {
+      const activeIDs = hopAttempt === 1 ? ids : lane.ids;
+      let lastOutcome: AttemptOutcome = {
+        response: undefined,
+        error: undefined,
+        attempts: 0,
+        records: [],
+        alias: "",
+        shaped: false,
+      };
+      for (const baseURL of upstreams) {
+        const result = await this.attemptAnonymous(
+          baseURL,
+          protocol,
+          body,
+          activeIDs,
+          requestID,
+          model,
+          lane.edge,
+          lane.machineId,
+        );
+        attempts += result.attempts;
+        records.push(...result.records);
+        lastOutcome = result;
+        if (result.response !== undefined && result.response.status < 300) {
+          return {
+            status: result.response.status,
+            bodyPreview: "",
+            value: result,
+          };
+        }
       }
-      lastResponse = result.response ?? lastResponse;
-      lastError = result.error ?? lastError;
-      lastAlias = result.alias;
-      lastShaped = result.shaped;
-    }
+      const status = lastOutcome.response?.status ?? 0;
+      return {
+        status,
+        bodyPreview: status === 429 || status === 403 ? "QuotaExceeded" : "",
+        value: lastOutcome,
+      };
+    });
+
+    const final = guarded.value;
     return {
-      response: lastResponse,
-      error: lastError,
+      response: final.response,
+      error: final.response !== undefined && final.response.status < 300 ? undefined : final.error,
       attempts,
       records,
-      alias: lastAlias,
-      shaped: lastShaped,
+      alias: final.alias,
+      shaped: final.shaped,
     };
   }
 
@@ -242,8 +240,9 @@ export class AttemptRunner {
     ids: RequestIDs,
     requestID: string,
     model: string,
+    edge: string,
+    machineId: string,
   ): Promise<AttemptOutcome> {
-    const records: UpstreamAttemptRecord[] = [];
     const shaped = shapeBody(body, protocol, baseURL);
     const started = Date.now();
     let response: UpstreamResponse | undefined;
@@ -256,49 +255,32 @@ export class AttemptRunner {
         ids,
         ANONYMOUS_CREDENTIAL,
         this.timeoutSeconds,
+        edge,
+        machineId,
       );
     } catch (caught) {
       error = caught instanceof Error ? caught : new Error(String(caught));
     }
     const durationMs = Date.now() - started;
     const status = response?.status ?? 0;
-    const success = error === undefined && status >= 200 && status < 300;
-    const record: UpstreamAttemptRecord = {
-      time: new Date().toISOString(),
-      request_id: requestID,
+    const record = buildAttemptRecord(this.metrics, {
+      requestID,
       model,
       tier: "zen",
-      attempt: records.length + 1,
-      key_id: "anonymous",
+      attempt: 1,
+      keyID: "anonymous",
       channel: "anonymous",
       anonymous: true,
-      proxy_node: "",
+      proxyNode: edge,
       status,
-      duration_ms: durationMs,
-      success,
-      outcome: success ? "success" : outcomeFor(status, error),
-    };
-    records.push(record);
-    this.metrics.recordAttempt({
-      time: record.time,
-      request_id: requestID,
-      model,
-      tier: "zen",
-      attempt: record.attempt,
-      key_id: "anonymous",
-      channel: "anonymous",
-      anonymous: true,
-      proxy_node: "",
-      status,
-      duration_ms: durationMs,
-      success,
-      outcome: record.outcome,
+      durationMs,
+      error,
     });
     return {
       response,
       error,
       attempts: 1,
-      records,
+      records: [record],
       alias: shaped.alias,
       shaped: shaped.shaped,
     };

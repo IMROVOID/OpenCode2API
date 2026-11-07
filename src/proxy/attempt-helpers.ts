@@ -8,6 +8,7 @@ import type { Logger } from "../telemetry/logger.js";
 import type { Metrics } from "../telemetry/metrics.js";
 import type { UpstreamAttemptRecord } from "../types/inference.js";
 import { keyDisplayId } from "../config/secrets.js";
+import { buildEdgeFetchInit } from "../unlimited/lane.js";
 import {
   type UpstreamResponse,
 } from "./upstream-client.js";
@@ -71,8 +72,13 @@ export async function sendRequest(
   ids: RequestIDs,
   key: string,
   timeoutSeconds: number,
+  edge = "",
+  machineId = "",
 ): Promise<UpstreamResponse> {
   const request = buildUpstreamRequest(baseURL, protocol, body, ids, key);
+  if (machineId !== "") {
+    request.headers.set("x-opencode-machine-id", machineId);
+  }
   const controller = new AbortController();
   const timer = setTimeout(
     () => {
@@ -81,12 +87,16 @@ export async function sendRequest(
     timeoutSeconds * 1000,
   );
   try {
-    const response = await fetch(request.url, {
-      method: "POST",
-      headers: request.headers,
-      body: request.body,
-      signal: controller.signal,
-    });
+    const init = buildEdgeFetchInit(
+      {
+        method: "POST",
+        headers: request.headers,
+        body: request.body,
+        signal: controller.signal,
+      },
+      edge,
+    );
+    const response = await fetch(request.url, init);
     return {
       status: response.status,
       headers: response.headers,
@@ -162,6 +172,44 @@ export function parseRetryAfterHeader(headers: Headers | undefined): number {
 // keyDisplayOf returns the display id of a key.
 export function keyDisplayOf(key: string): string {
   return keyDisplayId(key);
+}
+
+// buildAttemptRecord builds and records one UpstreamAttemptRecord.
+export function buildAttemptRecord(
+  metrics: Metrics,
+  params: {
+    requestID: string;
+    model: string;
+    tier: "zen" | "go";
+    attempt: number;
+    keyID: string;
+    channel: "key" | "anonymous";
+    anonymous: boolean;
+    proxyNode?: string;
+    status: number;
+    durationMs: number;
+    error: Error | undefined;
+  },
+): UpstreamAttemptRecord {
+  const success =
+    params.error === undefined && params.status >= 200 && params.status < 300;
+  const record: UpstreamAttemptRecord = {
+    time: new Date().toISOString(),
+    request_id: params.requestID,
+    model: params.model,
+    tier: params.tier,
+    attempt: params.attempt,
+    key_id: params.keyID,
+    channel: params.channel,
+    anonymous: params.anonymous,
+    proxy_node: params.proxyNode ?? "",
+    status: params.status,
+    duration_ms: params.durationMs,
+    success,
+    outcome: success ? "success" : outcomeFor(params.status, params.error),
+  };
+  metrics.recordAttempt({ ...record });
+  return record;
 }
 
 export type { Logger, Metrics, UpstreamAttemptRecord };

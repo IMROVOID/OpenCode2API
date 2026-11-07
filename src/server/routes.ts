@@ -1,6 +1,7 @@
 import type { ServerResponse } from "node:http";
 import type { Protocol } from "../types/config.js";
 import { isPlainObject, sliceAt, stringAt } from "../protocol/json-util.js";
+import { buildDoctorReport, resolveEdgePool } from "../unlimited/index.js";
 import { RequestDispatcher, type RouteContext } from "./dispatcher.js";
 import { serverKeyScope, type Gateway } from "./gateway.js";
 
@@ -13,6 +14,22 @@ export function registerRoutes(dispatcher: RequestDispatcher, gateway: Gateway):
     public: true,
     handler: (context) => {
       writeJSON(context.response, 200, healthPayload(gateway));
+    },
+  });
+  dispatcher.register({
+    method: "GET",
+    path: "/v1/unlimited/doctor",
+    protocol: "chat",
+    handler: (context) => {
+      void handleUnlimitedDoctor(context, gateway);
+    },
+  });
+  dispatcher.register({
+    method: "POST",
+    path: "/v1/unlimited/hop",
+    protocol: "chat",
+    handler: (context) => {
+      void handleUnlimitedHop(context, gateway);
     },
   });
   dispatcher.register({
@@ -38,6 +55,41 @@ export function registerRoutes(dispatcher: RequestDispatcher, gateway: Gateway):
       },
     });
   }
+}
+
+// handleUnlimitedDoctor answers with the unlimited guard and egress health report.
+async function handleUnlimitedDoctor(
+  context: RouteContext,
+  gateway: Gateway,
+): Promise<void> {
+  const guard = gateway.runner.guard;
+  const pool = await resolveEdgePool();
+  guard.setPool(pool);
+  const report = await buildDoctorReport(guard, fetch, "node");
+  writeJSON(context.response, 200, report);
+}
+
+// handleUnlimitedHop rotates the active edge and device/session identity.
+async function handleUnlimitedHop(
+  context: RouteContext,
+  gateway: Gateway,
+): Promise<void> {
+  const guard = gateway.runner.guard;
+  const oldEdge = guard.current().edge;
+  const pool = await resolveEdgePool();
+  guard.setPool(pool);
+  const rotated = guard.hop(pool, true);
+  const snap = guard.snapshot();
+  writeJSON(context.response, 200, {
+    status: "rotated",
+    old_edge: oldEdge,
+    new_edge: rotated.edge,
+    prefix64: rotated.prefix64,
+    session: rotated.ids.session,
+    machine_id: rotated.machineId,
+    hops: snap.hops,
+    blacklisted_count: snap.blacklist.length,
+  });
 }
 
 // handleCompletion serves one completion request.

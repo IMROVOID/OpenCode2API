@@ -1,11 +1,13 @@
 import type { Protocol } from "../types/config.js";
-import { buildUpstreamRequest } from "../protocol/upstream-request.js";
 import { canonicalSessionID, randomID, type RequestIDs } from "../protocol/identity.js";
 import { deriveRequestIDs } from "../protocol/request-identity.js";
-import { isV1Upstream } from "../protocol/lanes.js";
-import { prepareAnonymousBody } from "../protocol/tools.js";
 import { buildErrorEnvelope } from "../protocol/error.js";
 import { WEBUI_HTML } from "../webui/document.js";
+import {
+  forwardWithUnlimitedGuard,
+  handleWorkerDoctor,
+  handleWorkerHop,
+} from "./unlimited.js";
 
 // The environment the Worker reads its configuration from.
 export interface WorkerEnv {
@@ -25,12 +27,15 @@ const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
   "Access-Control-Allow-Headers":
     "Content-Type, Authorization, x-api-key, x-opencode-session, x-opencode-session-id, x-session-affinity, x-session-id, x-opencode-request, x-opencode-project, x-parent-session-id, x-opencode-client, Accept",
+  "Access-Control-Expose-Headers":
+    "x-request-id, x-opencode-edge, x-opencode-hops",
   "Access-Control-Max-Age": "86400",
 };
 
 // The default upstream lanes.
 const DEFAULT_ZEN = "https://opencode.ai/zen";
 const DEFAULT_GO = "https://opencode.ai/zen/go";
+const ANONYMOUS_CREDENTIAL = "public";
 
 // The Worker serves the API and, when it is enabled, the control WebUI.
 export default {
@@ -76,6 +81,18 @@ async function handle(request: Request, env: WorkerEnv): Promise<Response> {
   if (url.pathname === "/v1/health" || url.pathname === "/healthz") {
     return jsonResponse({ status: "ok", version: "dev" });
   }
+  if (url.pathname === "/v1/unlimited/doctor" && request.method === "GET") {
+    if (!authorized(request, env)) {
+      return unauthorized();
+    }
+    return jsonResponse(await handleWorkerDoctor());
+  }
+  if (url.pathname === "/v1/unlimited/hop" && request.method === "POST") {
+    if (!authorized(request, env)) {
+      return unauthorized();
+    }
+    return jsonResponse(await handleWorkerHop());
+  }
   if (url.pathname === "/v1/models") {
     if (!authorized(request, env)) {
       return unauthorized();
@@ -104,47 +121,12 @@ async function handle(request: Request, env: WorkerEnv): Promise<Response> {
   if (model === "") {
     return errorResponse(protocol, 400, "model is required", "invalid_request_error");
   }
-  return forward(request, env, protocol, payload);
-}
-
-// forward sends the request to the upstream lane and returns its answer.
-async function forward(
-  request: Request,
-  env: WorkerEnv,
-  protocol: Protocol,
-  payload: Record<string, unknown>,
-): Promise<Response> {
   const ids = deriveRequestIDs(
     headersToDict(request.headers),
     payload,
     "worker",
   );
-  const tier = pickTier(env);
-  const key = tier === "go" ? firstKey(env.OPENCODE_GO_KEYS) : firstKey(env.OPENCODE_ZEN_KEYS);
-  const baseURL = baseURLFor(env, tier);
-  const body = shapeBody(JSON.stringify(payload), protocol, baseURL);
-  const upstream = buildUpstreamRequest(baseURL, protocol, body, ids, key);
-  const response = await fetch(upstream.url, {
-    method: "POST",
-    headers: upstream.headers,
-    body: upstream.body,
-  });
-  const headers = new Headers(response.headers);
-  headers.set("x-request-id", ids.request);
-  for (const [name, value] of Object.entries(CORS_HEADERS)) {
-    headers.set(name, value);
-  }
-  return new Response(response.body, { status: response.status, headers });
-}
-
-// shapeBody applies the upstream gate's request shaping to a body.
-function shapeBody(
-  body: string,
-  protocol: Protocol,
-  baseURL: string,
-): string {
-  const prepared = prepareAnonymousBody(body, protocol, isV1Upstream(baseURL));
-  return prepared.body;
+  return forwardWithUnlimitedGuard(env, protocol, payload, ids, CORS_HEADERS);
 }
 
 // pickTier chooses the lane a request is served on.
@@ -184,15 +166,28 @@ function authorized(request: Request, env: WorkerEnv): boolean {
     return true;
   }
   const header = request.headers.get("x-api-key");
-  if (header !== null && header === expected) {
+  if (header !== null && constantTimeStringEquals(header, expected)) {
     return true;
   }
   const authorization = request.headers.get("authorization");
   if (authorization === null) {
     return false;
   }
-  return authorization.toLowerCase().startsWith("bearer ") &&
-    authorization.slice(7).trim() === expected;
+  return (
+    authorization.toLowerCase().startsWith("bearer ") &&
+    constantTimeStringEquals(authorization.slice(7).trim(), expected)
+  );
+}
+
+function constantTimeStringEquals(left: string, right: string): boolean {
+  if (left.length !== right.length) {
+    return false;
+  }
+  let diff = 0;
+  for (let i = 0; i < left.length; i += 1) {
+    diff |= left.charCodeAt(i) ^ right.charCodeAt(i);
+  }
+  return diff === 0;
 }
 
 // webuiEnabled reports whether the control WebUI is served.
@@ -204,7 +199,9 @@ function webuiEnabled(env: WorkerEnv): boolean {
 async function modelsResponse(env: WorkerEnv): Promise<Response> {
   const tier = pickTier(env);
   const baseURL = baseURLFor(env, tier);
-  const key = tier === "go" ? firstKey(env.OPENCODE_GO_KEYS) : firstKey(env.OPENCODE_ZEN_KEYS);
+  const configuredKey =
+    tier === "go" ? firstKey(env.OPENCODE_GO_KEYS) : firstKey(env.OPENCODE_ZEN_KEYS);
+  const key = configuredKey !== "" ? configuredKey : ANONYMOUS_CREDENTIAL;
   try {
     const response = await fetch(`${baseURL.replace(/\/+$/, "")}/v1/models`, {
       headers: {

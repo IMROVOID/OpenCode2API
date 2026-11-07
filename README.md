@@ -36,6 +36,7 @@
 - [Advanced Guides](#advanced-guides)
   - [Protocol Conversion](#protocol-conversion)
   - [Key Rotation & Failure Handling](#key-rotation--failure-handling)
+  - [Unlimited Lane & Self-Healing Guard](#unlimited-lane--self-healing-guard)
   - [Environment Variables](#environment-variables)
 - [Development & Testing](#development--testing)
   - [Continuous Integration (CI)](#continuous-integration-ci)
@@ -65,11 +66,12 @@
 - **Four Deployment Methods**:
   - **Local Daemon**: Runs on `127.0.0.1:8080` with a control WebUI on `127.0.0.1:8081`.
   - **Built Release**: Cross-platform ZIP archives for Linux, Windows and macOS on x64 and arm64, each with an example configuration.
-  - **Cloudflare Worker**: A standalone 82 KB bundle with no Node built-ins.
+  - **Cloudflare Worker**: A standalone 95.5 KB bundle with no Node built-ins.
   - **npm**: `npm install -g opencode2api-proxy`.
 - **Model Catalog Discovery**: The Zen and Go listings refresh on a timer, and OpenCode's capability catalog teaches the router which protocol each model actually speaks.
 - **Protocol-Native Routing**: A request is sent in the upstream's own protocol, so no conversion happens on the hot path unless the client asked for a different one.
 - **Key Rotation & Cooldown**: A 401, 403 or 429 rotates to the next key of the tier; the failing key is cooled down with an exponential backoff, and a non-retryable 4xx leaves the tier immediately.
+- **Unlimited Lane & Self-Healing Guard**: Discovers live Cloudflare `AAAA` edge pools via DoH (`1.1.1.1/dns-query`), steers Worker subrequests with `cf.resolveOverride`, rotates device/session/project identities on `QuotaExceeded` / `429` walls (up to 8 hops), blacklists burned `/64` prefixes (200-entry cap with oldest-block recycling), and exposes `/v1/unlimited/doctor` and `/v1/unlimited/hop`.
 - **Full SSE Streaming**: Reasoning deltas, tool call arguments and the usage report survive the trip, and a non-streaming client gets the same answer collapsed back into one document.
 - **Control WebUI**: A greyscale dark dashboard with the overview, the model routing table, the API keys, the quota, a Playground, the rotation groups, the configuration, the account and a live log stream.
 - **Safe & Resource-Bounded**:
@@ -217,11 +219,12 @@ In your Worker, go to **Settings** -> **Variables and Secrets** and add:
 
 | Variable | Type | Required | Description |
 |---|---|---|---|
-| `OPENCODE_ZEN_KEYS` | Secret | Optional | Your Zen key. Several keys are separated by commas. |
+| `OPENCODE_ZEN_KEYS` | Secret | Optional | Your Zen key. Several keys are separated by commas. Omit to use the anonymous `"public"` free lane. |
 | `OPENCODE_GO_KEYS` | Secret | Optional | Your Go key. Several keys are separated by commas. |
 | `API_KEY` | Secret | Optional | Client bearer key (e.g. `sk-local-key`). |
 | `UPSTREAM_ZEN` | Text | Optional | Zen base URL (defaults to `https://opencode.ai/zen`). |
 | `UPSTREAM_GO` | Text | Optional | Go base URL (defaults to `https://opencode.ai/zen/go`). |
+| `UPSTREAM_ANONYMOUS` | Text | Optional | Anonymous v2 base URL (defaults to `https://opencode.ai/inference`). |
 | `WEBUI_ENABLED` | Text | Optional | Set to `false` to hide the control WebUI. |
 
 Click **Save and deploy**.
@@ -390,9 +393,15 @@ OpenCode2API-Proxy/
 │   │   └── delivery.ts           # The response relay and the conversion
 │   ├── auth/
 │   │   └── key-pool.ts           # The key pool with its cooldown
+│   ├── unlimited/
+│   │   ├── lane.ts               # DoH AAAA edge pool, /64 normalization & identity rotation
+│   │   ├── guard.ts              # Quota-wall detector, /64 blacklist & self-healing hop loop
+│   │   ├── doctor.ts             # Cloudflare egress verifier & health diagnostics
+│   │   └── index.ts              # Public unlimited module exports
 │   ├── server/
 │   │   ├── dispatcher.ts         # Route matching, CORS and client authentication
 │   │   ├── gateway.ts            # The runtime that owns the pools and the catalog
+│   │   ├── routes.ts             # Public API routes (/v1/*, /v1/unlimited/*, /healthz)
 │   │   ├── completion-handler.ts # The core completion flow
 │   │   └── admin/                # The control WebUI and the admin API
 │   ├── telemetry/
@@ -407,12 +416,13 @@ OpenCode2API-Proxy/
 │   │   ├── index.ts              # The CLI entrypoint
 │   │   └── commands/start.ts     # The daemon command
 │   └── worker/
-│       └── index.ts              # The Cloudflare Workers fetch entrypoint
+│       ├── index.ts              # The Cloudflare Workers fetch entrypoint
+│       └── unlimited.ts          # Worker self-healing guard, hop & doctor handlers
 ├── worker/
-│   └── worker.js                 # Standalone Cloudflare Worker bundle (82 KB)
+│   └── worker.js                 # Standalone Cloudflare Worker bundle (95.5 KB)
 ├── dist/
-│   └── cli.js                    # Standalone Node.js CLI executable bundle (301 KB)
-├── tests/                        # 131 automated unit & integration tests
+│   └── cli.js                    # Standalone Node.js CLI executable bundle (309.7 KB)
+├── tests/                        # 145 automated unit & integration tests
 ├── scripts/
 │   ├── build.ts                  # The esbuild build pipeline
 │   ├── build-release.ts          # The cross-platform archive builder
@@ -457,6 +467,26 @@ Put several keys in `zen_keys` or `go_keys` and the router distributes the reque
 
 The rotation groups add one more layer: an alias like `sota` rotates across the models of its group, so a request keeps working when one model is rate-limited.
 
+### Unlimited Lane & Self-Healing Guard
+
+Both the Cloudflare Worker and the Node.js daemon embed the `opencode-unlimited-usage` self-healing engine (`src/unlimited/`):
+
+1. **Live DoH Edge Pool (`zen-lane`)**: Resolves live `AAAA` records for `opencode.ai` over Cloudflare DNS-over-HTTPS (`https://1.1.1.1/dns-query?name=opencode.ai&type=AAAA`), falling back to verified Cloudflare IPv6 edge literals (`2606:4700:10::ac42:ad95`, `2606:4700:10::ac42:ad96`, `2606:4700:10::6814:2011`). On Cloudflare Workers, subrequests are steered directly via `cf.resolveOverride`.
+2. **Quota-Wall Sniffer & Auto-Hop (`zen-guard`)**: When an upstream attempt returns HTTP `429`, `403 FreeTierError`, or a body containing `QuotaExceeded` / `Free usage limit reached`, the guard normalizes the current IPv6 edge to its `/64` prefix, adds it to a 200-entry blacklist (recycling the oldest `/64` block when all pool edges are burned), generates a fresh device/session/project identity (`ses_`, `msg_`, 40-hex `project`, 32-hex `machineId`), and retries up to `8` hops transparently.
+3. **Diagnostic & Manual Rotation Endpoints (`doctor` & `zen-hop`)**:
+   - `GET /v1/unlimited/doctor` — Reports runtime mode (`cloudflare-worker` or `node`), outbound IPv6 `/64` egress verification (`2606:*` / `2a09:*`), active edge and session identity, hop count, and `/64` blacklist telemetry.
+   - `POST /v1/unlimited/hop` — Blacklists the current edge and rotates immediately to a fresh `/64` edge and device/session identity.
+
+```bash
+# Check unlimited lane & guard health
+curl http://127.0.0.1:8080/v1/unlimited/doctor \
+  -H "Authorization: Bearer sk-your-local-key"
+
+# Manually hop to a fresh edge and device/session identity
+curl -X POST http://127.0.0.1:8080/v1/unlimited/hop \
+  -H "Authorization: Bearer sk-your-local-key"
+```
+
 ### Environment Variables
 
 | Variable | Mode | Default | Description |
@@ -472,6 +502,17 @@ The rotation groups add one more layer: an alias like `sota` rotates across the 
 | `ADMIN_PASSWORD` | Worker | *(None)* | Control WebUI password |
 
 ## Development & Testing
+
+<!-- AUTO-GENERATED:SCRIPTS -->
+| Command | Description |
+|---|---|
+| `npm run typecheck` | Run TypeScript compiler type checking (`tsc --noEmit`) |
+| `npm test` | Run automated unit and integration test suite (`tsx --test tests/**/*.test.ts`) |
+| `npm run build` | Bundle standalone CLI (`dist/cli.js`) and Cloudflare Worker (`worker/worker.js`) |
+| `npm run build:release` | Build cross-platform release ZIP archives into `release/` |
+| `npm run prepublishOnly` | Run typecheck, tests, and bundle build before publishing |
+| `npm start` | Start the local proxy daemon directly from TypeScript source |
+<!-- /AUTO-GENERATED:SCRIPTS -->
 
 Run typecheck:
 
@@ -536,6 +577,7 @@ The archives land in `release/`.
 ## References & Acknowledgements
 
 - [jasonxu114514/opencode2api](https://github.com/jasonxu114514/opencode2api) — Original reference repository for OpenCode API proxying and reverse engineering.
+- [ElectronBreach/opencode-unlimited-usage](https://github.com/ElectronBreach/opencode-unlimited-usage) — Reference implementation for `AAAA` edge pool rotation, `/64` prefix blacklisting, and self-healing quota-wall recovery.
 
 ## License
 
