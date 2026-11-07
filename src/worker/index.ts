@@ -6,6 +6,14 @@ import { buildErrorEnvelope } from "../protocol/error.js";
 import { BUILTIN_FREE_MODELS } from "../unlimited/index.js";
 import { WEBUI_HTML } from "../webui/document.js";
 import {
+  handleAdminConfig,
+  handleAdminLogin,
+  handleAdminLogout,
+  handleAdminModels,
+  handleAdminMonitor,
+  handleAdminSession,
+} from "./admin.js";
+import {
   forwardWithUnlimitedGuard,
   handleWorkerDoctor,
   handleWorkerHop,
@@ -20,7 +28,11 @@ export interface WorkerEnv {
   UPSTREAM_GO?: string;
   UPSTREAM_ANONYMOUS?: string;
   UPSTREAM_KILO?: string;
+  ADMIN_USERNAME?: string;
   ADMIN_PASSWORD?: string;
+  WEBUI_PASSWORD?: string;
+  WEBUI_PATH?: string;
+  ADMIN_PATH?: string;
   WEBUI_ENABLED?: string;
 }
 
@@ -70,7 +82,37 @@ async function handle(request: Request, env: WorkerEnv): Promise<Response> {
   if (request.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: CORS_HEADERS });
   }
-  if (url.pathname === "/" || url.pathname === "/index.html") {
+
+  // WebUI Admin Authentication & Monitoring endpoints
+  if (url.pathname === "/api/auth/login" && request.method === "POST") {
+    return handleAdminLogin(request, env as never, CORS_HEADERS);
+  }
+  if (url.pathname === "/api/auth/session" && request.method === "GET") {
+    return handleAdminSession(request, CORS_HEADERS);
+  }
+  if (url.pathname === "/api/auth/logout" && request.method === "POST") {
+    return handleAdminLogout(request, CORS_HEADERS);
+  }
+  if (url.pathname === "/api/monitor" && request.method === "GET") {
+    return handleAdminMonitor(env as never, CORS_HEADERS);
+  }
+  if (url.pathname === "/api/debug/models" && request.method === "GET") {
+    return handleAdminModels(CORS_HEADERS);
+  }
+  if (url.pathname === "/api/config" && request.method === "GET") {
+    return handleAdminConfig(env as never, CORS_HEADERS);
+  }
+  if (url.pathname === "/api/api-keys") {
+    return jsonResponse({ keys: [] });
+  }
+  if (url.pathname === "/api/model-quotas") {
+    return jsonResponse({ quotas: [] });
+  }
+  if (url.pathname === "/api/rotation") {
+    return jsonResponse({ rotation: { sota: [], sweet: [] } });
+  }
+
+  if (isWebUIPath(url.pathname, env)) {
     if (!webuiEnabled(env)) {
       return jsonResponse({ error: { message: "not found" } }, 404);
     }
@@ -81,8 +123,13 @@ async function handle(request: Request, env: WorkerEnv): Promise<Response> {
       },
     });
   }
+
+  if (url.pathname === "/") {
+    return jsonResponse({ name: "OpenCode2API", status: "ok", version: "2.2.5" });
+  }
+
   if (url.pathname === "/v1/health" || url.pathname === "/healthz") {
-    return jsonResponse({ status: "ok", version: "dev" });
+    return jsonResponse({ status: "ok", version: "2.2.5" });
   }
   if (url.pathname === "/v1/unlimited/doctor" && request.method === "GET") {
     if (!authorized(request, env)) {
@@ -191,6 +238,22 @@ function constantTimeStringEquals(left: string, right: string): boolean {
     diff |= left.charCodeAt(i) ^ right.charCodeAt(i);
   }
   return diff === 0;
+}
+
+// isWebUIPath reports whether the requested path matches the configured WebUI route.
+function isWebUIPath(pathname: string, env: WorkerEnv): boolean {
+  const configured = (env.WEBUI_PATH ?? env.ADMIN_PATH ?? "/").trim();
+  const normalized = configured === "" ? "/" : configured;
+  if (normalized === "/") {
+    return pathname === "/" || pathname === "/index.html";
+  }
+  const base = normalized.startsWith("/") ? normalized : `/${normalized}`;
+  const trimmed = base.replace(/\/+$/, "");
+  return (
+    pathname === trimmed ||
+    pathname === `${trimmed}/` ||
+    pathname === `${trimmed}/index.html`
+  );
 }
 
 // webuiEnabled reports whether the control WebUI is served.

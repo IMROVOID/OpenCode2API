@@ -66,12 +66,14 @@
 - **Four Deployment Methods**:
   - **Local Daemon**: Runs on `127.0.0.1:8080` with a control WebUI on `127.0.0.1:8081`.
   - **Built Release**: Cross-platform ZIP archives for Linux, Windows and macOS on x64 and arm64, each with an example configuration.
-  - **Cloudflare Worker**: A standalone 95.5 KB bundle with no Node built-ins.
+  - **Cloudflare Worker**: A standalone bundle with no Node built-ins, full control WebUI, and self-healing rotation.
   - **npm**: `npm install -g opencode2api-proxy`.
 - **Model Catalog Discovery**: The Zen and Go listings refresh on a timer, and OpenCode's capability catalog teaches the router which protocol each model actually speaks.
 - **Protocol-Native Routing**: A request is sent in the upstream's own protocol, so no conversion happens on the hot path unless the client asked for a different one.
 - **Key Rotation & Cooldown**: A 401, 403 or 429 rotates to the next key of the tier; the failing key is cooled down with an exponential backoff, and a non-retryable 4xx leaves the tier immediately.
-- **Unlimited Lane & Self-Healing Guard**: Discovers live Cloudflare `AAAA` edge pools via DoH (`1.1.1.1/dns-query`), steers Worker subrequests with `cf.resolveOverride`, rotates device/session/project identities on `QuotaExceeded` / `429` walls (up to 8 hops), blacklists burned `/64` prefixes (200-entry cap with oldest-block recycling), and exposes `/v1/unlimited/doctor` and `/v1/unlimited/hop`.
+- **Dual-Lane Self-Healing & Quota Bypass**:
+  - **OpenCode Unlimited Lane**: Discovers live Cloudflare `AAAA` edge pools via DoH (`1.1.1.1/dns-query`), steers Worker subrequests with `cf.resolveOverride`, rotates device/session/project identities on `QuotaExceeded` / `429` walls (up to 8 hops), and blacklists burned `/64` prefixes.
+  - **Kilo Free Gateway Failover**: Seamless secondary fallback to high-throughput free models without quotas.
 - **Full SSE Streaming**: Reasoning deltas, tool call arguments and the usage report survive the trip, and a non-streaming client gets the same answer collapsed back into one document.
 - **Control WebUI**: A greyscale dark dashboard with the overview, the model routing table, the API keys, the quota, a Playground, the rotation groups, the configuration, the account and a live log stream.
 - **Safe & Resource-Bounded**:
@@ -215,19 +217,37 @@ Open [`worker/worker.js`](./worker/worker.js) and copy the entire file contents.
 
 #### Step 3: Add Variables & Secrets
 
-In your Worker, go to **Settings** -> **Variables and Secrets** and add:
+In your Worker, go to **Settings** -> **Variables and Secrets** and configure as needed:
 
-| Variable | Type | Required | Description |
+| Variable | Type | Default | Description |
 |---|---|---|---|
-| `OPENCODE_ZEN_KEYS` | Secret | Optional | Your Zen key. Several keys are separated by commas. Omit to use the anonymous `"public"` free lane. |
-| `OPENCODE_GO_KEYS` | Secret | Optional | Your Go key. Several keys are separated by commas. |
-| `API_KEY` | Secret | Optional | Client bearer key (e.g. `sk-local-key`). |
-| `UPSTREAM_ZEN` | Text | Optional | Zen base URL (defaults to `https://opencode.ai/zen`). |
-| `UPSTREAM_GO` | Text | Optional | Go base URL (defaults to `https://opencode.ai/zen/go`). |
-| `UPSTREAM_ANONYMOUS` | Text | Optional | Anonymous v2 base URL (defaults to `https://opencode.ai/inference`). |
-| `WEBUI_ENABLED` | Text | Optional | Set to `false` to hide the control WebUI. |
+| `ADMIN_USERNAME` | Text / Secret | `admin` | Username for the control WebUI |
+| `ADMIN_PASSWORD` / `WEBUI_PASSWORD` | Secret | `admin` | Password for the control WebUI (change from default in production!) |
+| `WEBUI_PATH` / `ADMIN_PATH` | Text | `/` | Web path where the control panel is served (e.g. `/admin`). When customized, `/` returns API health JSON. |
+| `WEBUI_ENABLED` | Text | `true` | Set to `false` to completely disable the control WebUI |
+| `API_KEY` | Secret | *(None)* | Client bearer authorization key (e.g. `sk-local-key`). Required if clients must authenticate. |
+| `OPENCODE_ZEN_KEYS` | Secret | *(None)* | Your OpenCode Zen key(s). Multiple keys separated by commas. |
+| `OPENCODE_GO_KEYS` | Secret | *(None)* | Your OpenCode Go key(s). Multiple keys separated by commas. |
+| `KILO_API_KEY` | Secret | *(None)* | Kilo Free Gateway key for zero-quota fallback |
+| `KILO_API_BASE` | Text | `https://api.kilo.ai/v1` | Kilo API base URL |
+| `UPSTREAM_ZEN` | Text | `https://opencode.ai/zen` | Zen upstream base URL |
+| `UPSTREAM_GO` | Text | `https://opencode.ai/zen/go` | Go upstream base URL |
+| `UPSTREAM_ANONYMOUS` | Text | `https://opencode.ai/inference` | Anonymous free upstream base URL |
 
 Click **Save and deploy**.
+
+#### Worker Control Panel
+
+The built-in control panel provides a live dashboard for monitoring requests, model routing, active pools, quotas, and testing completions in a Playground.
+
+- **Access URL**: By default, navigate to `https://opencode2api-proxy.<your-subdomain>.workers.dev/` (or custom path like `/admin` if `WEBUI_PATH` is set).
+- **Default Username**: `admin`
+- **Default Password**: `admin`
+- **Session Auth**: Stores a secure HTTP-only cookie (`opencode2api_session`).
+- **Custom Path Routing**: When `WEBUI_PATH="/admin"` is configured:
+  - `GET /` serves `{ "name": "OpenCode2API", "status": "ok", "admin": "/admin" }`
+  - `GET /admin` serves the full interactive dashboard
+  - All API routes (`/v1/chat/completions`, etc.) continue serving client requests cleanly.
 
 Your Cloudflare Worker API URL:
 
@@ -467,15 +487,40 @@ Put several keys in `zen_keys` or `go_keys` and the router distributes the reque
 
 The rotation groups add one more layer: an alias like `sota` rotates across the models of its group, so a request keeps working when one model is rate-limited.
 
-### Unlimited Lane & Self-Healing Guard
+### Unlimited Lane & Dual-Lane Architecture
 
-Both the Cloudflare Worker and the Node.js daemon embed the `opencode-unlimited-usage` self-healing engine (`src/unlimited/`):
+OpenCode enforces strict rate limits and device quotas on free-tier inference (`[429]: Free usage limit reached`). OpenCode2API provides a dual-lane architecture to maintain high availability:
 
-1. **Live DoH Edge Pool (`zen-lane`)**: Resolves live `AAAA` records for `opencode.ai` over Cloudflare DNS-over-HTTPS (`https://1.1.1.1/dns-query?name=opencode.ai&type=AAAA`), falling back to verified Cloudflare IPv6 edge literals (`2606:4700:10::ac42:ad95`, `2606:4700:10::ac42:ad96`, `2606:4700:10::6814:2011`). On Cloudflare Workers, subrequests are steered directly via `cf.resolveOverride`.
-2. **Quota-Wall Sniffer & Auto-Hop (`zen-guard`)**: When an upstream attempt returns HTTP `429`, `403 FreeTierError`, or a body containing `QuotaExceeded` / `Free usage limit reached`, the guard normalizes the current IPv6 edge to its `/64` prefix, adds it to a 200-entry blacklist (recycling the oldest `/64` block when all pool edges are burned), generates a fresh device/session/project identity (`ses_`, `msg_`, 40-hex `project`, 32-hex `machineId`), and retries up to `8` hops transparently.
-3. **Diagnostic & Manual Rotation Endpoints (`doctor` & `zen-hop`)**:
-   - `GET /v1/unlimited/doctor` — Reports runtime mode (`cloudflare-worker` or `node`), outbound IPv6 `/64` egress verification (`2606:*` / `2a09:*`), active edge and session identity, hop count, and `/64` blacklist telemetry.
-   - `POST /v1/unlimited/hop` — Blacklists the current edge and rotates immediately to a fresh `/64` edge and device/session identity.
+```text
+Incoming Client Request
+       │
+       ▼
+ ┌──────────────┐
+ │ Quota Check  │
+ └──────┬───────┘
+        │
+        ├────────────────────────────────────────────────┐
+        ▼ (Lane A)                                       ▼ (Lane B)
+ ┌───────────────────────────────┐              ┌─────────────────────────────────┐
+ │ OpenCode v2.2.5 Direct Lane   │              │ Kilo Free Gateway Failover      │
+ ├───────────────────────────────┤              ├─────────────────────────────────┤
+ │ • Live DoH Cloudflare AAAA    │              │ • Zero-quota free tier models   │
+ │ • cf.resolveOverride routing  │ ──(Quota ──► │ • Automatic secondary fallback  │
+ │ • /64 block blacklist (200)   │    Wall)     │ • KILO_API_KEY / KILO_API_BASE  │
+ │ • Clean device ID generation  │              └─────────────────────────────────┘
+ │ • Auto-hop (up to 8 attempts) │
+ └───────────────────────────────┘
+```
+
+1. **OpenCode v2.2.5 Direct Lane (`zen-lane` & `zen-guard`)**:
+   - **Live DoH Edge Pool**: Resolves live `AAAA` records for `opencode.ai` via Cloudflare DNS-over-HTTPS (`1.1.1.1/dns-query`), falling back to verified Cloudflare IPv6 edge literals (`2606:4700:10::ac42:ad95`, `2606:4700:10::ac42:ad96`, `2606:4700:10::6814:2011`). On Cloudflare Workers, subrequests are steered directly via `cf.resolveOverride`.
+   - **Self-Healing Auto-Hop**: When an upstream request hits a `429`, `403 FreeTierError`, or body containing `QuotaExceeded` / `Free usage limit reached`, the guard normalizes the edge to its `/64` prefix, blacklists it, generates a fresh device identity (`ses_`, `msg_`, 40-hex `project`, 32-hex `machineId`), and retries with a new edge (up to `8` hops transparently).
+   - **Oldest-Block Recycling**: Blacklists up to 200 `/64` blocks. If all edges are blacklisted, it recycles the oldest block to prevent starvation.
+2. **Kilo Free Gateway Failover**:
+   - If direct OpenCode lanes are saturated or repeatedly blocked, configure `KILO_API_KEY` to enable instant fallback to high-throughput free models without quota limits.
+3. **Diagnostic & Hop Endpoints**:
+   - `GET /v1/unlimited/doctor` — Inspects outbound IPv6 `/64` egress, active edge and session identity, hop count, and blacklist telemetry.
+   - `POST /v1/unlimited/hop` — Manually rotates to a fresh `/64` edge and identity immediately.
 
 ```bash
 # Check unlimited lane & guard health
@@ -491,15 +536,19 @@ curl -X POST http://127.0.0.1:8080/v1/unlimited/hop \
 
 | Variable | Mode | Default | Description |
 |---|---|---|---|
-| `OPENCODE2API_CONFIG` | Local | `./config.json` | Path to the configuration file |
+| `OPENCODE2API_CONFIG` | Local | `./config.json` | Path to local configuration file |
 | `API_KEY` | Worker | *(None)* | Client authorization bearer token |
-| `OPENCODE_ZEN_KEYS` | Worker | *(None)* | Comma-separated Zen keys |
-| `OPENCODE_GO_KEYS` | Worker | *(None)* | Comma-separated Go keys |
-| `UPSTREAM_ZEN` | Worker | `https://opencode.ai/zen` | Zen base URL |
-| `UPSTREAM_GO` | Worker | `https://opencode.ai/zen/go` | Go base URL |
-| `UPSTREAM_ANONYMOUS` | Worker | `https://opencode.ai/inference` | Anonymous base URL |
-| `WEBUI_ENABLED` | Worker | `true` | Set to `false` to hide the control WebUI |
-| `ADMIN_PASSWORD` | Worker | *(None)* | Control WebUI password |
+| `ADMIN_USERNAME` | Worker | `admin` | Control panel username |
+| `ADMIN_PASSWORD` / `WEBUI_PASSWORD` | Worker | `admin` | Control panel password |
+| `WEBUI_PATH` / `ADMIN_PATH` | Worker | `/` | Web path where the control panel is served (e.g. `/admin`) |
+| `WEBUI_ENABLED` | Worker | `true` | Set to `false` to disable the control WebUI entirely |
+| `OPENCODE_ZEN_KEYS` | Worker | *(None)* | Comma-separated OpenCode Zen keys |
+| `OPENCODE_GO_KEYS` | Worker | *(None)* | Comma-separated OpenCode Go keys |
+| `KILO_API_KEY` | Worker | *(None)* | Kilo Free Gateway API key for quota failover |
+| `KILO_API_BASE` | Worker | `https://api.kilo.ai/v1` | Kilo Free Gateway base URL |
+| `UPSTREAM_ZEN` | Worker | `https://opencode.ai/zen` | Zen upstream base URL |
+| `UPSTREAM_GO` | Worker | `https://opencode.ai/zen/go` | Go upstream base URL |
+| `UPSTREAM_ANONYMOUS` | Worker | `https://opencode.ai/inference` | Anonymous free upstream base URL |
 
 ## Development & Testing
 
@@ -550,13 +599,30 @@ To skip the test suite on specific commits (e.g. for docs updates, asset additio
 
 When triggered manually via **Actions** -> **Run workflow**, check the **Skip running automated tests** input option.
 
-### Building the Release Archives
+### Building & Publishing Releases
 
-The [Build release archives](.github/workflows/release.yml) workflow is manual only. Trigger it from **Actions** -> **Build release archives** -> **Run workflow** and supply a semantic version tag.
+The [Release workflow](.github/workflows/release.yml) builds multi-arch platform binaries and the standalone Cloudflare Worker bundle, publishing them as a **Draft Release** on GitHub.
 
-It builds Linux, Windows and macOS archives for x64 and arm64, writes a **Draft** release with the archives attached, and each archive holds the executable, a separate `config.example.json`, the README and the license.
+#### Trigger Options
 
-To build the same archives locally:
+1. **Manual Trigger (`workflow_dispatch`)**:
+   - Go to **Actions** -> **Release** -> **Run workflow**.
+   - **Tag**: Release tag (defaults to `v` + `version` from `package.json`, e.g. `v1.0.0`).
+   - **Draft**: Create as Draft release (defaults to `true`). Uncheck when ready to publish publicly.
+   - **Overwrite**: If a release or tag with this name already exists, delete and recreate it (defaults to `true`).
+   - **Custom Release Notes**: Optional markdown text to use as release notes. Leave empty to use GitHub's auto-generated release notes.
+   - **Skip tests**: Check to bypass test execution during release packaging.
+2. **Automatic Trigger via Commit Flag**:
+   - Push a commit to `master` containing `[release]`, `[draft-release]`, or `[release-draft]` in the commit message.
+   - Automatically builds and publishes a Draft release for the current `package.json` version.
+
+#### Release Assets
+
+Each release attaches:
+- 6 platform ZIP archives: `linux-x64`, `linux-arm64`, `win-x64`, `win-arm64`, `macos-x64`, `macos-arm64`.
+- Standalone Cloudflare Worker script: `worker.js` (evaluated and pre-tested).
+
+To build the release archives locally:
 
 ```bash
 npm run build

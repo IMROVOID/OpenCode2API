@@ -335,4 +335,78 @@ describe("Cloudflare Worker unlimited endpoints & forwarding", () => {
     assert.equal(response.status, 200);
     assert.equal(msg["content"], "Hello world");
   });
+
+  it("serves Worker control panel login, session, and monitor endpoints with customizable path & password", async () => {
+    // Arrange
+    const env = {
+      ADMIN_USERNAME: "custom-admin",
+      ADMIN_PASSWORD: "secret-password",
+      WEBUI_PATH: "/control-panel",
+    };
+
+    // 1. Root / returns API status when WEBUI_PATH is customized
+    const rootRes = await worker.fetch(new Request("https://worker.example/"), env);
+    assert.equal(rootRes.status, 200);
+    const rootJson = (await rootRes.json()) as Record<string, unknown>;
+    assert.equal(rootJson["name"], "OpenCode2API");
+
+    // 2. /control-panel serves the HTML WebUI
+    const panelRes = await worker.fetch(new Request("https://worker.example/control-panel"), env);
+    assert.equal(panelRes.status, 200);
+    assert.match(await panelRes.text(), /<title>OpenCode2API Control Panel<\/title>/);
+
+    // 3. Unauthenticated /api/auth/session returns 401
+    const unauthSession = await worker.fetch(new Request("https://worker.example/api/auth/session"), env);
+    assert.equal(unauthSession.status, 401);
+
+    // 4. Failed login returns 401
+    const failedLogin = await worker.fetch(
+      new Request("https://worker.example/api/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username: "custom-admin", password: "wrong-password" }),
+      }),
+      env,
+    );
+    assert.equal(failedLogin.status, 401);
+
+    // 5. Successful login returns 200 and Set-Cookie
+    const loginRes = await worker.fetch(
+      new Request("https://worker.example/api/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username: "custom-admin", password: "secret-password" }),
+      }),
+      env,
+    );
+    assert.equal(loginRes.status, 200);
+    const cookieHeader = loginRes.headers.get("Set-Cookie");
+    assert.match(cookieHeader ?? "", /opencode_admin_session=/);
+    const loginJson = (await loginRes.json()) as Record<string, unknown>;
+    assert.equal(loginJson["success"], true);
+    assert.equal(typeof loginJson["csrf_token"], "string");
+
+    // 6. Authenticated session returns username and csrf_token
+    const authSession = await worker.fetch(
+      new Request("https://worker.example/api/auth/session", {
+        headers: { Cookie: cookieHeader ?? "" },
+      }),
+      env,
+    );
+    assert.equal(authSession.status, 200);
+    const sessionJson = (await authSession.json()) as Record<string, unknown>;
+    assert.equal(sessionJson["username"], "custom-admin");
+
+    // 7. /api/monitor returns valid overview metrics
+    const monitorRes = await worker.fetch(
+      new Request("https://worker.example/api/monitor", {
+        headers: { Cookie: cookieHeader ?? "" },
+      }),
+      env,
+    );
+    assert.equal(monitorRes.status, 200);
+    const monitorJson = (await monitorRes.json()) as Record<string, unknown>;
+    assert.ok(monitorJson["metrics"]);
+    assert.ok(monitorJson["worker"]);
+  });
 });

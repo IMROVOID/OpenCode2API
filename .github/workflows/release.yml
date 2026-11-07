@@ -4,25 +4,39 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag, for example v1.0.0"
-        required: true
+        description: "Release tag (e.g. v1.0.0, or leave empty to use package.json version)"
+        required: false
         type: string
+        default: ""
       draft:
         description: "Create the release as a draft"
         required: false
         type: boolean
         default: true
+      overwrite:
+        description: "Overwrite existing release if tag already exists"
+        required: false
+        type: boolean
+        default: true
+      release_notes:
+        description: "Custom release notes (leave blank to auto-generate from commits)"
+        required: false
+        type: string
+        default: ""
       skip_tests:
         description: "Skip running automated tests"
         required: false
         type: boolean
         default: false
+  push:
+    branches:
+      - master
 
 permissions:
   contents: write
 
 concurrency:
-  group: release-${{ inputs.tag }}
+  group: release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -30,24 +44,69 @@ jobs:
     name: Prepare release
     runs-on: ubuntu-latest
     outputs:
+      should_run: ${{ steps.metadata.outputs.should_run }}
       release_tag: ${{ steps.metadata.outputs.release_tag }}
+      is_draft: ${{ steps.metadata.outputs.is_draft }}
+      overwrite: ${{ steps.metadata.outputs.overwrite }}
+      skip_tests: ${{ steps.metadata.outputs.skip_tests }}
     steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
       - name: Resolve release metadata
         id: metadata
         shell: bash
         env:
+          EVENT_NAME: ${{ github.event_name }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
           DISPATCH_TAG: ${{ inputs.tag }}
+          DISPATCH_DRAFT: ${{ inputs.draft }}
+          DISPATCH_OVERWRITE: ${{ inputs.overwrite }}
+          DISPATCH_SKIP_TESTS: ${{ inputs.skip_tests }}
         run: |
-          release_tag="$DISPATCH_TAG"
-          if [[ ! "$release_tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]; then
-            echo "Release tag must be a semantic version such as v1.0.0 or v1.0.0-rc.1" >&2
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" = "push" ]; then
+            if [[ "$COMMIT_MSG" != *"[release]"* && "$COMMIT_MSG" != *"[draft-release]"* && "$COMMIT_MSG" != *"[release-draft]"* ]]; then
+              echo "Push commit does not contain [release] or [draft-release] flag. Skipping."
+              echo "should_run=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            is_draft="true"
+            overwrite="true"
+            skip_tests="false"
+          else
+            is_draft="${DISPATCH_DRAFT:-true}"
+            overwrite="${DISPATCH_OVERWRITE:-true}"
+            skip_tests="${DISPATCH_SKIP_TESTS:-false}"
+          fi
+
+          echo "should_run=true" >> "$GITHUB_OUTPUT"
+          echo "is_draft=$is_draft" >> "$GITHUB_OUTPUT"
+          echo "overwrite=$overwrite" >> "$GITHUB_OUTPUT"
+          echo "skip_tests=$skip_tests" >> "$GITHUB_OUTPUT"
+
+          tag="${DISPATCH_TAG:-}"
+          if [ -z "$tag" ]; then
+            pkg_version=$(node -p "require('./package.json').version")
+            tag="v$pkg_version"
+          fi
+          if [[ ! "$tag" =~ ^v ]]; then
+            tag="v$tag"
+          fi
+
+          if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]; then
+            echo "Release tag must be a valid semantic version like v1.0.0 or v1.0.0-rc.1: $tag" >&2
             exit 1
           fi
-          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+
+          echo "release_tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Target Release Tag: $tag (draft: $is_draft, overwrite: $overwrite)"
 
   verify:
     name: Verify source
     needs: [prepare]
+    if: needs.prepare.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
@@ -66,12 +125,12 @@ jobs:
         run: npm run typecheck
 
       - name: Run test suite
-        if: inputs.skip_tests != true
+        if: needs.prepare.outputs.skip_tests != 'true'
         run: npm test
 
       - name: Skip tests notice
-        if: inputs.skip_tests == true
-        run: echo "ℹ️ Automated tests skipped via skip flag."
+        if: needs.prepare.outputs.skip_tests == 'true'
+        run: echo "ℹ️ Automated tests skipped via flag."
 
       - name: Build the bundles
         run: npm run build
@@ -89,6 +148,7 @@ jobs:
   build:
     name: Build ${{ matrix.target }}
     needs: [prepare, verify]
+    if: needs.prepare.outputs.should_run == 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -165,7 +225,8 @@ jobs:
 
   release:
     name: Create the draft release
-    needs: [prepare, build]
+    needs: [prepare, verify, build]
+    if: needs.prepare.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Download the archives
@@ -178,21 +239,38 @@ jobs:
       - name: List the archives
         run: ls -la release
 
-      - name: Publish the draft release
+      - name: Publish the release
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
-          DRAFT: ${{ inputs.draft }}
+          IS_DRAFT: ${{ needs.prepare.outputs.is_draft }}
+          OVERWRITE: ${{ needs.prepare.outputs.overwrite }}
+          CUSTOM_NOTES: ${{ inputs.release_notes }}
         run: |
           set -euo pipefail
-          draft_flag="--draft"
-          if [[ "$DRAFT" != "true" ]]; then
-            draft_flag=""
+
+          if [ "$OVERWRITE" = "true" ]; then
+            if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+              echo "Release $RELEASE_TAG already exists and overwrite=true. Deleting previous release..."
+              gh release delete "$RELEASE_TAG" --yes --cleanup-tag || true
+            fi
           fi
+
+          draft_flag=""
+          if [ "$IS_DRAFT" = "true" ]; then
+            draft_flag="--draft"
+          fi
+
+          notes_args="--generate-notes"
+          if [ -n "$CUSTOM_NOTES" ]; then
+            printf "%s\n" "$CUSTOM_NOTES" > release_notes.md
+            notes_args="--notes-file release_notes.md"
+          fi
+
           gh release create "$RELEASE_TAG" \
             release/*.zip \
             release/worker.js \
             --title "OpenCode2API-Proxy $RELEASE_TAG" \
-            --generate-notes \
+            $notes_args \
             $draft_flag
